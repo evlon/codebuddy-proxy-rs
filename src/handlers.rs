@@ -1,33 +1,22 @@
-/// OpenAI 兼容的 HTTP 面：`/health`、`/v1/models`、`/v1/chat/completions`。
+/// OpenAI 兼容的 HTTP 面：`/health`、`/v1/models`（动态）、`/v1/models/{id}`、`/v1/chat/completions`。
 ///
 /// 聊天请求原样透传到 CodeBuddy 后端（仅强制 `stream=true`）；客户端要流式就逐字节
 /// 透传 SSE（可选旁路录制到日志），要非流式则在后端流结束后聚合为单个 completion。
-/// 可选能力与 codebuddy2openai 对齐：API key 校验、请求日志、system 合规词脱敏。
+/// 模型列表动态拉取官方 `/v3/config`（与官方 CLI `/model` 选择器同源），并附上下文
+/// 窗口元数据，便于客户端做压缩/截断决策、避免上下文溢出。
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use axum::{
     body::{Body, to_bytes},
-    extract::{Request, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, header},
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use crate::{aggregate, auth, desensitize, logging};
-
-const MODEL_IDS: &[&str] = &[
-    "auto",
-    "default",
-    "deepseek-v4-flash",
-    "deepseek-v4-pro",
-    "hy3",
-    "glm-5v-turbo",
-    "kimi-k2-instruct-taiji",
-    "default-1.2",
-    "hunyuan-turbos-vision",
-];
+use crate::{aggregate, auth, desensitize, logging, models};
 
 /// 应用共享状态。
 pub struct AppState {
@@ -36,6 +25,8 @@ pub struct AppState {
     api_key: String,
     logger: Option<logging::Logger>,
     desensitize: bool,
+    /// 动态模型目录（/v3/config，TTL 缓存 + 失败兜底）。
+    pub catalog: models::ModelCatalog,
 }
 
 impl AppState {
@@ -46,8 +37,17 @@ impl AppState {
         api_key: String,
         logger: Option<logging::Logger>,
         desensitize: bool,
+        models_ttl_secs: u64,
     ) -> Self {
-        AppState { auth: auth::Auth::new(auth_file, client.clone()), client, api_key, logger, desensitize }
+        let catalog = models::ModelCatalog::new(client.clone(), models_ttl_secs);
+        AppState {
+            auth: auth::Auth::new(auth_file, client.clone()),
+            client,
+            api_key,
+            logger,
+            desensitize,
+            catalog,
+        }
     }
 }
 
@@ -65,6 +65,17 @@ fn error_response(status: u16, message: String) -> Response {
     json_response(status, &json!({ "error": { "message": message, "type": "upstream_error" } }))
 }
 
+fn not_found_response(model_id: &str) -> Response {
+    json_response(
+        404,
+        &json!({ "error": {
+            "message": format!("The model '{model_id}' does not exist"),
+            "code": "model_not_found",
+            "type": "invalid_request_error",
+        }}),
+    )
+}
+
 /// 启用了 --api-key 时校验 Authorization: Bearer <key> 或 X-Api-Key。
 fn api_key_allowed(headers: &HeaderMap, key: &str) -> bool {
     if key.is_empty() {
@@ -80,6 +91,16 @@ fn api_key_allowed(headers: &HeaderMap, key: &str) -> bool {
         .and_then(|value| value.strip_prefix("Bearer ").map(str::to_string));
     let token = bearer.filter(|s| !s.is_empty()).or_else(|| extract("x-api-key"));
     token.as_deref() == Some(key)
+}
+
+/// 对外暴露的模型 id 列表：保留 "auto"（代理默认槽位名，后端接受）在首位。
+fn ids_with_auto(available: Vec<String>) -> Vec<String> {
+    let mut ids = Vec::with_capacity(available.len() + 1);
+    if !available.iter().any(|s| s == "auto") {
+        ids.push("auto".to_string());
+    }
+    ids.extend(available);
+    ids
 }
 
 /// 取最后一条 user 消息的可读摘要（日志用，截断 60 字符）。
@@ -118,15 +139,49 @@ pub async fn health() -> impl IntoResponse {
     "ok"
 }
 
-pub async fn models(headers: HeaderMap, State(state): State<Shared>) -> Response {
+/// 动态模型列表。默认走缓存（TTL 由 --models-ttl 控制）；?refresh=1 强制重拉。
+pub async fn models(
+    query: Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<Shared>,
+) -> Response {
     if !api_key_allowed(&headers, &state.api_key) {
         return error_response(401, "invalid api key".into());
     }
-    let data: Vec<Value> = MODEL_IDS
+    let force = query
+        .0
+        .get("refresh")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let (available, metas) = state.catalog.get(&state.auth, force).await;
+    let ids = ids_with_auto(available);
+    let data: Vec<Value> = ids
         .iter()
-        .map(|id| json!({ "id": id, "object": "model", "created": 1700000000, "owned_by": "codebuddy" }))
+        .map(|id| {
+            let mid = models::meta_model_id(id);
+            models::list_item(id, models::meta_for(&metas, mid))
+        })
         .collect();
     json_response(200, &json!({ "object": "list", "data": data }))
+}
+
+/// 单个模型详情（OpenAI 协议 GET /v1/models/{model}），附上下文别名与后端元数据。
+pub async fn model_detail(
+    Path(model_id): Path<String>,
+    headers: HeaderMap,
+    State(state): State<Shared>,
+) -> Response {
+    if !api_key_allowed(&headers, &state.api_key) {
+        return error_response(401, "invalid api key".into());
+    }
+    let (available, metas) = state.catalog.get(&state.auth, false).await;
+    let ids = ids_with_auto(available);
+    if !ids.contains(&model_id) {
+        return not_found_response(&model_id);
+    }
+    let mid = models::meta_model_id(&model_id);
+    let item = models::detail_item(&model_id, models::meta_for(&metas, mid));
+    json_response(200, &item)
 }
 
 pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
@@ -176,12 +231,12 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         logger.block("REQUEST BODY", &serde_json::to_string(&up_body).unwrap_or_default());
     }
 
-    // 转发到后端
+    // 转发到后端（官方 CLI 形态的请求头，见 auth::chat_headers）
     let session = match state.auth.session().await {
         Ok(s) => s,
         Err(e) => return error_response(401, e),
     };
-    let mut headers = auth::headers_of(&session);
+    let mut headers = auth::chat_headers(&session);
     headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
     headers.insert(header::ACCEPT, header::HeaderValue::from_static("text/event-stream"));
     let url = format!("{}/v2/chat/completions", auth::BACKEND);

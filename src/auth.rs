@@ -2,10 +2,14 @@
 ///
 /// 与官方客户端及 codebuddy2openai 使用同一份 `auth/*.info`，只读 + 按需回写刷新结果，
 /// 不做登录、不存密码。
+///
+/// 请求指纹：出站请求全部模拟官方 CLI（@tencent-ai/codebuddy-code）形态，降低后端
+/// 按 UA / 头特征把代理流量画像为"第三方转换器"的概率（详见 README「降低风控识别」）。
 
 use std::{
     env, fs,
     path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -16,13 +20,54 @@ use serde_json::{Map, Value, json};
 pub const BACKEND: &str = "https://copilot.tencent.com";
 /// 兜底域名（登录文件未记录时使用）。
 const DEFAULT_DOMAIN: &str = "www.codebuddy.cn";
-/// 本代理的自报 UA（后端以 UA 画像区分“个人转换器”与大厂 agent 框架）。
-pub const UA: &str = "codebuddy-proxy-rs/0.1.0";
+
+/// 官方 CLI 形态的 User-Agent（逆向自官方 2.169.0 的 UserAgentHttpInterceptor 并实测）：
+///   `{platform}/{platformVersion} {productName}/{productVersion}` + 可选扩展段。
+/// 后端校验（实测，见 README「降低风控识别」）：
+///   - 须含 "CLI/<x> CodeBuddy/<y>" 两段；缺 "CodeBuddy/<y>" → /v3/config 返回
+///     400 code=12403（check ua）；缺 "CLI/<x>" → 200 但不下发 models/agents；
+///   - <y> 版本内容不校验（"abc" 亦通过）；"CodeBuddy-Code/2.169.0" 之类连字名不识别。
+/// platformVersion 官方为空时即 "unknown"；productVersion 跟随官方 CLI 当前版本。
+pub const UA: &str = "CLI/unknown CodeBuddy/2.169.0";
+
+/// 部署类型（官方 ProductEndpointHttpInterceptor 注入 `X-Product: <deploymentType>`）。
+const PRODUCT: &str = "SaaS";
+
 /// token 剩余寿命低于该值即提前刷新。
 const REFRESH_MARGIN_MS: u128 = 60_000;
 
 fn now_ms() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+// ---------- 简易伪随机 ID（官方用 UUID；此处无 uuid 依赖，xorshift64* + 时间/进程熵） ----------
+
+fn uuid_v4() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut seed = nanos
+        ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15)
+        ^ n.wrapping_mul(0xBF58476D1CE4E5B9);
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        chunk.copy_from_slice(&seed.wrapping_mul(0x2545F4914F6CDD1D).to_le_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
+    bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+}
+
+/// 官方 injectRequestIdHeader：无 X-Trace-ID 时 X-Request-ID 用无横线 UUID。
+fn request_id() -> String {
+    uuid_v4().replace('-', "")
 }
 
 fn get_str(map: Option<&Map<String, Value>>, key: &str) -> String {
@@ -97,20 +142,47 @@ fn parse_session(info: &Value) -> Result<Session, String> {
     })
 }
 
-/// 从会话构建鉴权头（不含 content-type / accept，由调用方按需补充）。
+/// 基础鉴权头（官方全局拦截器行为：UA + X-Product + X-Request-ID + 会话鉴权头）。
+/// 不含 content-type / accept，由调用方按需补充。
 pub fn headers_of(session: &Session) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(UA));
-    let mut set = |name: &'static str, value: String| {
+    let set = |headers: &mut HeaderMap, name: &'static str, value: String| {
         if let Ok(v) = HeaderValue::from_str(&value) {
             headers.insert(HeaderName::from_static(name), v);
         }
     };
-    set("authorization", format!("Bearer {}", session.access));
-    set("x-user-id", session.uid.clone());
-    set("x-enterprise-id", session.enterprise.clone());
-    set("x-tenant-id", session.enterprise.clone());
-    set("x-domain", session.domain.clone());
+    set(&mut headers, "x-product", PRODUCT.into());
+    set(&mut headers, "x-request-id", request_id());
+    set(&mut headers, "authorization", format!("Bearer {}", session.access));
+    set(&mut headers, "x-user-id", session.uid.clone());
+    set(&mut headers, "x-enterprise-id", session.enterprise.clone());
+    set(&mut headers, "x-tenant-id", session.enterprise.clone());
+    set(&mut headers, "x-domain", session.domain.clone());
+    headers
+}
+
+/// 聊天请求头：基础鉴权头 + 官方 ModelRequestProcessor 给模型请求注入的内部头
+/// （X-IDE-* / X-Agent-* / X-Trace-ID / X-Conversation-* 族，值均为每请求新生成的 ID）。
+pub fn chat_headers(session: &Session) -> HeaderMap {
+    let mut headers = headers_of(session);
+    let trace = uuid_v4();
+    let set = |headers: &mut HeaderMap, name: &'static str, value: String| {
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.insert(HeaderName::from_static(name), v);
+        }
+    };
+    set(&mut headers, "x-ide-type", "CLI".into());
+    set(&mut headers, "x-ide-name", "CLI".into());
+    set(&mut headers, "x-ide-version", "unknown".into());
+    set(&mut headers, "x-agent-intent", "craft".into());
+    set(&mut headers, "x-agent-runtime", "local-agent".into());
+    set(&mut headers, "x-trace-id", trace.clone());
+    // 官方 injectRequestIdHeader：存在 X-Trace-ID 时 X-Request-ID 复用其值
+    set(&mut headers, "x-request-id", trace);
+    set(&mut headers, "x-conversation-id", uuid_v4());
+    set(&mut headers, "x-conversation-request-id", uuid_v4());
+    set(&mut headers, "x-conversation-message-id", uuid_v4());
     headers
 }
 
