@@ -15,7 +15,9 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 - 复用 CodeBuddy 桌面登录态，token 临近过期自动刷新并原子回写
 - 可选 `--api-key` 鉴权（`Authorization: Bearer` 或 `X-Api-Key`）
 - 可选 `--log`：请求 / 原始 SSE 旁路录制，便于排查内容审核拦截
-- 可选 `--desensitize`：system 合规词零宽空格脱敏，缓解后端误拦
+- 可选 `--desensitize`：system 合规词零宽空格脱敏，缓解后端误拦（词表含 `DeepSeek Harness` 竞品签名）
+- 可选 `--user-escape`：user 消息敏感术语转义（`[s[<逐字反转>]]` + 自动补解码说明）
+- 默认开 `--strip-harness`：清洗 system 里 dsh 三段全局签名（`DeepSeek Harness` 字面量即后端 `11128` 渠道拦截的匹配串）
 - `--save-auth` / `--restore-auth`：把本机登录态一键迁移到服务器
 - 单一静态二进制，无需运行时
 
@@ -35,15 +37,17 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 
 ## 降低风控识别（请求指纹模拟）
 
-早期版本自报 `User-Agent: codebuddy-proxy-rs/0.1.0`，等于在请求头里写明"我是第三方转换器"——后端确实按 UA 做画像与校验（逆向官方客户端 + 实测证实）。现改为**完整模拟官方 CLI（@tencent-ai/codebuddy-code 2.169.0）的请求指纹**：
+早期版本自报 `User-Agent: codebuddy-proxy-rs/0.1.0`，等于在请求头里写明"我是第三方转换器"——后端确实按 UA 做画像与校验（逆向官方客户端 + 实测证实）。现改为**完整模拟官方 CLI（@tencent-ai/codebuddy-code 2.171.0）的请求指纹**（与 codebuddy2openai 的身份面对齐）：
 
 | 出站请求 | 模拟的头 |
 |---|---|
-| 所有请求 | `User-Agent: CLI/unknown CodeBuddy/2.169.0`、`X-Product: SaaS`、`X-Request-ID`（每请求新生成 32 位 hex） |
-| `POST /v2/chat/completions` | 基础头 + `X-IDE-Type: CLI`、`X-IDE-Name: CLI`、`X-IDE-Version: unknown`、`X-Agent-Intent: craft`、`X-Agent-Runtime: local-agent`、`X-Trace-ID`、`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`（每请求新 UUID） |
+| 所有请求 | `User-Agent: CLI/unknown CodeBuddy/2.171.0`、`X-Product: SaaS`、`X-Product-Version`、`X-IDE-Type: CLI`、`X-IDE-Name: CLI`、`X-IDE-Version`、`X-Request-ID`（每请求新生成 32 位 hex）、`X-Private-Data`（默认 `true`，`--private-data false` 对齐官方 SaaS 默认） |
+| `POST /v2/chat/completions` | 基础头 + `X-Agent-Intent: craft`、`X-Agent-Runtime: local-agent`、`X-Agent-Type: main`、`X-Model-ID`、`X-Trace-ID`、`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`（每请求新 UUID） |
 | `GET /v3/config` | 基础头（该接口对 UA 有硬校验：缺 `CodeBuddy/<版本>` 段直接 400 code=12403；缺 `CLI/<x>` 段则 200 但不下发模型数据） |
 
 以上头集合与官方 CLI 的拦截器行为一一对应（UserAgentHttpInterceptor / ProductEndpointHttpInterceptor / CommonHeaderHttpInterceptor / ModelRequestProcessor）。实测后端会把 `X-Trace-ID` 回显为响应消息 id——这些头被真实消费，并非摆设。
+
+身份字段可经 `CLIENT_INFO_*` 环境变量整体覆盖（与官方 IDE 插件声明 VSCode 等身份的通道一致，逐键对齐）：`CLIENT_INFO_*` / `ACC_IDE_TYPE` / `CODEBUDDY2OPENAI_UA`（整条 UA 覆盖）/ `CODEBUDDY2OPENAI_UA_VERSION` / `CODEBUDDY2OPENAI_AGENT_INTENT|RUNTIME|TYPE`。
 
 **仍无法隐藏的行为特征**（知悉后再使用）：
 
@@ -52,6 +56,16 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 - 请求量与模型分布异常依然可能触发风控。
 
 指纹模拟只能降低"按客户端特征识别"的概率，**不能保证不被识别**；请仅在自己拥有合法订阅的前提下使用，并遵守 CodeBuddy 服务条款。
+
+## 内容审核误拦（code 11128 / 敏感词）
+
+后端对**system 消息做字面量关键词拦截**，两类已知特征（详见 codebuddy2openai 仓库的 SECURITY-REVIEW.md）：
+
+1. **竞品签名**：system 里出现字面量 `DeepSeek Harness`（dsh 客户端三段全局段落的签名）→ HTTP 400 `code=11128` "Illegal API invocation from an unapproved channel"。`--strip-harness`（默认开）把三段签名清洗掉：identity 段改写为 `You are CodeBuddy Code.`、source 段删除、web-surface 段替换为中性等效文本，残留变体兜底替换为 `CodeBuddy`；
+2. **合规模板词**：客户端合规模板里的"拒绝作恶"词汇（DoS/exploit/credential…）被误判 → `--desensitize` 插零宽空格；
+3. **用户措辞**：user 消息里的安全术语被拦 → `--user-escape` 包成 `[s[<逐字反转>]]` 并自动补解码说明，模型自行反转还义。
+
+三层与 [codebuddy2openai]（Python 版）语义一致（`cargo test` 内含与真实 dsh 签名文本的对照用例），可与其共享 dsh CodeBuddy 预设（双层防护互不冲突、幂等）。
 
 ## 登录文件位置
 
@@ -96,7 +110,10 @@ codebuddy-proxy-rs --host 0.0.0.0 --port 8787 --api-key sk-your-key
 | `--port <n>` | 监听端口，默认 `8787`（环境变量 `CODEBUDDY2OPENAI_KEY` / `CODEBUDDY2OPENAI_LOG` 可注入 key / log） |
 | `--api-key <key>` | 客户端须携带的 API key；空则不校验 |
 | `--log <path>` | 请求 / 原始 SSE 日志文件 |
-| `--desensitize` | 对 system 合规词插入零宽空格做脱敏 |
+| `--desensitize` | 对 system 合规词插入零宽空格做脱敏（词表含 `DeepSeek Harness`） |
+| `--user-escape` | 对 user 消息敏感术语转义（phishing → `[s[gnihsihp]]`），system 尚无解码说明时自动补 `CODEBUDDY_ESCAPE_CODEC` 段 |
+| `--strip-harness on\|off` | 清洗 system 里 dsh 三段全局签名（`harness:identity/source`、`app:web-surface`，字面量 `DeepSeek Harness` 即后端 `11128` 渠道拦截匹配串）。**默认 on**；`--strip-harness off` 或环境变量 `CODEBUDDY2OPENAI_STRIP_HARNESS=off` 可关 |
+| `--private-data true\|false` | `X-Private-Data` 标头取值，默认 `true`（隐私优先）；`false` 对齐官方 SaaS 默认 |
 | `--models-ttl <secs>` | 动态模型列表缓存秒数，默认 `600`；`0` 表示每次 `/v1/models` 都实时拉取（环境变量 `CODEBUDDY2OPENAI_MODELS_TTL`） |
 | `--skip-check` | 跳过启动账号预检 |
 | `--save-auth <file>` | 一次性导出本机登录文件到指定路径，执行后退出 |

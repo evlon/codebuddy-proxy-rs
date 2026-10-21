@@ -1,5 +1,5 @@
-/// 命令行配置：监听地址/端口、可选 API key、日志路径、脱敏开关、启动预检开关、
-/// 动态模型列表缓存秒数。
+/// 命令行配置：监听地址/端口、可选 API key、日志路径、脱敏/转义/签名清洗开关、
+/// X-Private-Data 取值、启动预检开关、动态模型列表缓存秒数、一次性导出/导入动作。
 
 pub struct Args {
     pub host: String,
@@ -10,6 +10,13 @@ pub struct Args {
     pub log: Option<String>,
     /// 对 system 消息做合规词脱敏（零宽空格），缓解后端内容审核误拦。
     pub desensitize: bool,
+    /// 对 user 消息做敏感术语转义（[s[<逐字反转>]] + 自动补解码说明）。
+    pub user_escape: bool,
+    /// 清洗 system 里的 DeepSeek Harness 签名（dsh 三段全局段落，11128 渠道拦截源）。
+    /// 默认开；--strip-harness off 可关（与 dsh CodeBuddy 预设的遮蔽幂等）。
+    pub strip_harness: bool,
+    /// X-Private-Data 标头取值；默认 true（隐私优先），false 对齐官方 SaaS 默认。
+    pub private_data: bool,
     /// 跳过启动预检（账号摘要打印）。
     pub skip_check: bool,
     /// 动态模型列表缓存秒数；0 表示每次 /v1/models 都实时拉取。
@@ -28,6 +35,9 @@ impl Default for Args {
             api_key: std::env::var("CODEBUDDY2OPENAI_KEY").unwrap_or_default(),
             log: std::env::var("CODEBUDDY2OPENAI_LOG").ok().filter(|s| !s.is_empty()),
             desensitize: false,
+            user_escape: env_flag("CODEBUDDY2OPENAI_USER_ESCAPE", false),
+            strip_harness: env_switch("CODEBUDDY2OPENAI_STRIP_HARNESS", true),
+            private_data: env_switch("CODEBUDDY2OPENAI_PRIVATE_DATA", true),
             skip_check: false,
             models_ttl: std::env::var("CODEBUDDY2OPENAI_MODELS_TTL")
                 .ok()
@@ -39,8 +49,25 @@ impl Default for Args {
     }
 }
 
+/// 环境变量布尔开关（1/true/yes 为真）。
+fn env_flag(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => default,
+    }
+}
+
+/// 环境变量 on/off 开关（未设置时用 default）。
+fn env_switch(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => !v.trim().eq_ignore_ascii_case("off") && !v.trim().eq_ignore_ascii_case("false"),
+        Err(_) => default,
+    }
+}
+
 /// 解析 `--host <ip>` / `--port <n>` / `--api-key <key>` / `--log <path>` /
-/// `--desensitize` / `--skip-check` / `--models-ttl <secs>` /
+/// `--desensitize` / `--user-escape` / `--strip-harness on|off` /
+/// `--private-data true|false` / `--skip-check` / `--models-ttl <secs>` /
 /// `--save-auth <file>` / `--restore-auth <file>`；未知参数忽略。
 pub fn parse() -> Args {
     let mut args = Args::default();
@@ -70,6 +97,17 @@ pub fn parse() -> Args {
                 }
             }
             "--desensitize" => args.desensitize = true,
+            "--user-escape" => args.user_escape = true,
+            "--strip-harness" => {
+                if let Some(value) = argv.next() {
+                    args.strip_harness = !value.trim().eq_ignore_ascii_case("off");
+                }
+            }
+            "--private-data" => {
+                if let Some(value) = argv.next() {
+                    args.private_data = !value.trim().eq_ignore_ascii_case("false");
+                }
+            }
             "--skip-check" => args.skip_check = true,
             "--models-ttl" => {
                 if let Some(value) = argv.next() {

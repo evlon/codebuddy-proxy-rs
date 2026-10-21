@@ -21,17 +21,89 @@ pub const BACKEND: &str = "https://copilot.tencent.com";
 /// 兜底域名（登录文件未记录时使用）。
 const DEFAULT_DOMAIN: &str = "www.codebuddy.cn";
 
-/// 官方 CLI 形态的 User-Agent（逆向自官方 2.169.0 的 UserAgentHttpInterceptor 并实测）：
+/// 官方 CLI 形态的 User-Agent（逆向自官方 UserAgentHttpInterceptor 并实测，版本对齐
+/// 官方 2.171.0，与 codebuddy2openai 一致）：
 ///   `{platform}/{platformVersion} {productName}/{productVersion}` + 可选扩展段。
 /// 后端校验（实测，见 README「降低风控识别」）：
 ///   - 须含 "CLI/<x> CodeBuddy/<y>" 两段；缺 "CodeBuddy/<y>" → /v3/config 返回
 ///     400 code=12403（check ua）；缺 "CLI/<x>" → 200 但不下发 models/agents；
 ///   - <y> 版本内容不校验（"abc" 亦通过）；"CodeBuddy-Code/2.169.0" 之类连字名不识别。
 /// platformVersion 官方为空时即 "unknown"；productVersion 跟随官方 CLI 当前版本。
-pub const UA: &str = "CLI/unknown CodeBuddy/2.169.0";
+/// 环境变量：CODEBUDDY2OPENAI_UA 整条覆盖；CODEBUDDY2OPENAI_UA_VERSION 覆盖版本号；
+/// 其余分段走 CLIENT_INFO_* 身份字段通道（见 identity_env）。
+pub fn build_user_agent() -> String {
+    if let Ok(ua) = env::var("CODEBUDDY2OPENAI_UA") {
+        if !ua.trim().is_empty() {
+            return ua;
+        }
+    }
+    let default_version = "2.171.0".to_string();
+    let platform = identity_env("CLIENT_INFO_PLATFORM").unwrap_or_else(|| "CLI".into());
+    let platform_version =
+        identity_env("CLIENT_INFO_PLATFORM_VERSION").unwrap_or_else(|| "unknown".into());
+    let product = identity_env("CLIENT_INFO_PRODUCT_NAME").unwrap_or_else(|| "CodeBuddy".into());
+    let product_version = identity_env("CLIENT_INFO_PRODUCT_VERSION")
+        .or(identity_env("CODEBUDDY2OPENAI_UA_VERSION"))
+        .unwrap_or(default_version);
+    let mut parts = vec![
+        format!("{platform}/{platform_version}"),
+        format!("{product}/{product_version}"),
+    ];
+    let extension = env::var("CLIENT_INFO_USER_AGENT_EXTENSION").unwrap_or_default();
+    if !extension.trim().is_empty() {
+        parts.push(extension);
+    }
+    parts.join(" ")
+}
 
 /// 部署类型（官方 ProductEndpointHttpInterceptor 注入 `X-Product: <deploymentType>`）。
 const PRODUCT: &str = "SaaS";
+
+/// 身份字段环境变量摄取：官方 getProcessEnvInfo 语义——存在且非空则覆盖。
+/// 从 bundle module 211504 的 ENV_CLIENT_INFO_KEYS 移植（README §身份面）。
+/// 其中 ideType 官方另有 ACC_IDE_TYPE 覆盖（优先级最高）。
+fn identity_env(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|s| !s.trim().is_empty())
+}
+
+fn ide_type() -> String {
+    identity_env("ACC_IDE_TYPE")
+        .or_else(|| identity_env("CLIENT_INFO_IDE_TYPE"))
+        .unwrap_or_else(|| "CLI".into())
+}
+
+/// 稳定区身份头（IDE/产品/遥测分段；官方 Ultima 拦截器对所有出站请求带上）：
+///   - X-IDE-Type / X-IDE-Name(=platform) / X-IDE-Version(=platformVersion)
+///   - X-Product(=deploy type, 上面 PRODUCT) / X-Product-Version
+///   - X-Private-Data：官方按企业策略/模型优化开关填。true=允许把私有数据用于
+///     训练改进/模型优化，能降低"再依据私有头做区间决策"的风控画像特征；
+///     false 与官方 SaaS 默认一致。默认 true（--private-data false 可调，隐私优先）。
+pub fn static_identity_headers(private_data: bool) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let insert = |headers: &mut HeaderMap, name: &'static str, value: String| {
+        if let Ok(v) = HeaderValue::from_str(&value) {
+            headers.insert(HeaderName::from_static(name), v);
+        }
+    };
+    let product_version = identity_env("CLIENT_INFO_PRODUCT_VERSION")
+        .or(identity_env("CODEBUDDY2OPENAI_UA_VERSION"))
+        .unwrap_or_else(|| "2.171.0".into());
+    insert(&mut headers, "x-ide-type", ide_type());
+    insert(
+        &mut headers,
+        "x-ide-name",
+        identity_env("CLIENT_INFO_PLATFORM").unwrap_or_else(|| "CLI".into()),
+    );
+    insert(
+        &mut headers,
+        "x-ide-version",
+        identity_env("CLIENT_INFO_PLATFORM_VERSION").unwrap_or_else(|| "0.0.0".into()),
+    );
+    insert(&mut headers, "x-product", PRODUCT.into());
+    insert(&mut headers, "x-product-version", product_version);
+    insert(&mut headers, "x-private-data", private_data.to_string());
+    headers
+}
 
 /// token 剩余寿命低于该值即提前刷新。
 const REFRESH_MARGIN_MS: u128 = 60_000;
@@ -142,11 +214,17 @@ fn parse_session(info: &Value) -> Result<Session, String> {
     })
 }
 
-/// 基础鉴权头（官方全局拦截器行为：UA + X-Product + X-Request-ID + 会话鉴权头）。
+/// 基础鉴权头（官方全局拦截器行为：UA + X-Product + X-Request-ID + 会话鉴权头 +
+/// 静态身份头 X-IDE-* / X-Product-Version / X-Private-Data）。
 /// 不含 content-type / accept，由调用方按需补充。
-pub fn headers_of(session: &Session) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(USER_AGENT, HeaderValue::from_static(UA));
+pub fn headers_of(session: &Session, private_data: bool) -> HeaderMap {
+    let mut headers = static_identity_headers(private_data);
+    let ua = build_user_agent();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(&ua)
+            .unwrap_or_else(|_| HeaderValue::from_static("CLI/unknown CodeBuddy/2.171.0")),
+    );
     let set = |headers: &mut HeaderMap, name: &'static str, value: String| {
         if let Ok(v) = HeaderValue::from_str(&value) {
             headers.insert(HeaderName::from_static(name), v);
@@ -163,20 +241,25 @@ pub fn headers_of(session: &Session) -> HeaderMap {
 }
 
 /// 聊天请求头：基础鉴权头 + 官方 ModelRequestProcessor 给模型请求注入的内部头
-/// （X-IDE-* / X-Agent-* / X-Trace-ID / X-Conversation-* 族，值均为每请求新生成的 ID）。
-pub fn chat_headers(session: &Session) -> HeaderMap {
-    let mut headers = headers_of(session);
+/// （X-IDE-* 已随静态身份头带上 / X-Agent-* / X-Trace-ID / X-Conversation-* 族，
+/// 值均为每请求新生成的 ID；X-Model-ID 标注本次请求的模型档位）。
+pub fn chat_headers(session: &Session, model: &str, private_data: bool) -> HeaderMap {
+    let mut headers = headers_of(session, private_data);
     let trace = uuid_v4();
     let set = |headers: &mut HeaderMap, name: &'static str, value: String| {
         if let Ok(v) = HeaderValue::from_str(&value) {
             headers.insert(HeaderName::from_static(name), v);
         }
     };
-    set(&mut headers, "x-ide-type", "CLI".into());
-    set(&mut headers, "x-ide-name", "CLI".into());
-    set(&mut headers, "x-ide-version", "unknown".into());
-    set(&mut headers, "x-agent-intent", "craft".into());
-    set(&mut headers, "x-agent-runtime", "local-agent".into());
+    set(&mut headers, "x-agent-intent",
+        env::var("CODEBUDDY2OPENAI_AGENT_INTENT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "craft".into()));
+    set(&mut headers, "x-agent-runtime",
+        env::var("CODEBUDDY2OPENAI_AGENT_RUNTIME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "local-agent".into()));
+    set(&mut headers, "x-agent-type",
+        env::var("CODEBUDDY2OPENAI_AGENT_TYPE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "main".into()));
+    if !model.is_empty() {
+        set(&mut headers, "x-model-id", model.to_string());
+    }
     set(&mut headers, "x-trace-id", trace.clone());
     // 官方 injectRequestIdHeader：存在 X-Trace-ID 时 X-Request-ID 复用其值
     set(&mut headers, "x-request-id", trace);
@@ -190,11 +273,18 @@ pub fn chat_headers(session: &Session) -> HeaderMap {
 pub struct Auth {
     path: PathBuf,
     client: reqwest::Client,
+    /// X-Private-Data 取值（默认 true；--private-data false 对齐官方 SaaS 默认）。
+    private_data: bool,
 }
 
 impl Auth {
-    pub fn new(path: PathBuf, client: reqwest::Client) -> Self {
-        Auth { path, client }
+    pub fn new(path: PathBuf, client: reqwest::Client, private_data: bool) -> Self {
+        Auth { path, client, private_data }
+    }
+
+    /// 当前 X-Private-Data 取值（供 models 拉取头复用）。
+    pub fn private_data(&self) -> bool {
+        self.private_data
     }
 
     /// 当前有效会话；临近过期先刷新并回写登录文件。
@@ -215,7 +305,7 @@ impl Auth {
     /// 调用后端刷新并原子写回，随后返回新会话。
     async fn refresh(&self, info: &Value, session: &Session) -> Result<Session, String> {
         let url = format!("{BACKEND}/v2/plugin/auth/token/refresh");
-        let mut headers = headers_of(session);
+        let mut headers = headers_of(session, self.private_data);
         let set = |headers: &mut HeaderMap, name: &'static str, value: String| {
             if let Ok(v) = HeaderValue::from_str(&value) {
                 headers.insert(HeaderName::from_static(name), v);

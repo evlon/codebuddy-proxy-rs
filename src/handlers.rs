@@ -25,6 +25,8 @@ pub struct AppState {
     api_key: String,
     logger: Option<logging::Logger>,
     desensitize: bool,
+    user_escape: bool,
+    strip_harness: bool,
     /// 动态模型目录（/v3/config，TTL 缓存 + 失败兜底）。
     pub catalog: models::ModelCatalog,
 }
@@ -37,15 +39,20 @@ impl AppState {
         api_key: String,
         logger: Option<logging::Logger>,
         desensitize: bool,
+        user_escape: bool,
+        strip_harness: bool,
+        private_data: bool,
         models_ttl_secs: u64,
     ) -> Self {
         let catalog = models::ModelCatalog::new(client.clone(), models_ttl_secs);
         AppState {
-            auth: auth::Auth::new(auth_file, client.clone()),
+            auth: auth::Auth::new(auth_file, client.clone(), private_data),
             client,
             api_key,
             logger,
             desensitize,
+            user_escape,
+            strip_harness,
             catalog,
         }
     }
@@ -213,6 +220,25 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
     let wants_stream = body_map.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut up_body = Value::Object(body_map);
     auth::ensure_stream_fields(&mut up_body);
+    // 内容审核误拦三层防护（顺序与 codebuddy2openai 一致：先清洗签名，再转义，再脱敏——
+    // 后面两层都基于清洗后的 system 文本工作）。
+    if state.strip_harness {
+        let n = desensitize::strip_harness_body(&mut up_body);
+        if n > 0 {
+            if let Some(logger) = &state.logger {
+                logger.line(&format!("── strip-harness: 清洗 {n} 处 DeepSeek Harness 签名"));
+            }
+        }
+    }
+    if state.user_escape {
+        let (n, decoder_added) = desensitize::escape_user_body(&mut up_body);
+        if n > 0 {
+            if let Some(logger) = &state.logger {
+                let extra = if decoder_added { "，已补解码说明" } else { "" };
+                logger.line(&format!("── user-escape: 转义 {n} 处{extra}"));
+            }
+        }
+    }
     if state.desensitize {
         desensitize::desensitize_body(&mut up_body);
     }
@@ -236,7 +262,7 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         Ok(s) => s,
         Err(e) => return error_response(401, e),
     };
-    let mut headers = auth::chat_headers(&session);
+    let mut headers = auth::chat_headers(&session, &model, state.auth.private_data());
     headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
     headers.insert(header::ACCEPT, header::HeaderValue::from_static("text/event-stream"));
     let url = format!("{}/v2/chat/completions", auth::BACKEND);

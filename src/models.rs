@@ -79,7 +79,7 @@ impl ModelCatalog {
 
     async fn fetch(&self, auth: &Auth) -> Result<(Vec<String>, Vec<Value>), String> {
         let session = auth.session().await?;
-        let mut headers = auth::headers_of(&session);
+        let mut headers = auth::headers_of(&session, auth.private_data());
         headers.insert(CONNECTION, HeaderValue::from_static("close"));
         let url = format!("{}/v3/config", auth::BACKEND);
         let response = self

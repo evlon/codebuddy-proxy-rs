@@ -40,6 +40,9 @@ async fn main() {
         args.api_key.clone(),
         logger,
         args.desensitize,
+        args.user_escape,
+        args.strip_harness,
+        args.private_data,
         args.models_ttl,
     ));
 
@@ -84,6 +87,13 @@ async fn main() {
     if args.desensitize {
         println!("   脱敏已启用（system 合规词插入零宽空格）");
     }
+    if args.user_escape {
+        println!("   用户转义  : 已启用（[s[...]] 反转编码 + 解码说明）");
+    }
+    if !args.strip_harness {
+        println!("   签名清洗  : 已关闭（--strip-harness off）");
+    }
+    println!("   隐私标志  : X-Private-Data={}（--private-data 可调）", args.private_data);
     println!("   模型缓存  : {} 秒（--models-ttl 可调）", args.models_ttl);
     axum::serve(listener, app).await.expect("server 退出异常");
 }
