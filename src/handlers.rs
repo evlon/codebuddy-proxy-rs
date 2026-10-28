@@ -27,6 +27,10 @@ pub struct AppState {
     desensitize: bool,
     user_escape: bool,
     strip_harness: bool,
+    /// --desensitize-scope all：脱敏扩展到全部角色消息 + tools 描述。
+    desensitize_scope_all: bool,
+    /// --official-shape（默认开）：补官方 body 形状字段（extra_vars.harnessMetadata 等）。
+    official_shape: bool,
     /// 动态模型目录（/v3/config，TTL 缓存 + 失败兜底）。
     pub catalog: models::ModelCatalog,
 }
@@ -43,6 +47,8 @@ impl AppState {
         strip_harness: bool,
         private_data: bool,
         models_ttl_secs: u64,
+        desensitize_scope_all: bool,
+        official_shape: bool,
     ) -> Self {
         let catalog = models::ModelCatalog::new(client.clone(), models_ttl_secs);
         AppState {
@@ -53,6 +59,8 @@ impl AppState {
             desensitize,
             user_escape,
             strip_harness,
+            desensitize_scope_all,
+            official_shape,
             catalog,
         }
     }
@@ -196,6 +204,15 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
     if !api_key_allowed(&parts.headers, &state.api_key) {
         return error_response(401, "invalid api key".into());
     }
+    // 优先复用客户端透传的 X-Conversation-ID（多轮客户端与服务端日志按会话关联）；
+    // 客户端未携带则 chat_headers 内部每次生成（官方对"新会话"的语义等同）。
+    let client_conversation_id = parts
+        .headers
+        .get("x-conversation-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
     let bytes = match to_bytes(body, 256 * 1024 * 1024).await {
         Ok(bytes) => bytes,
@@ -220,13 +237,18 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
     let wants_stream = body_map.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut up_body = Value::Object(body_map);
     auth::ensure_stream_fields(&mut up_body);
+    // 官方请求形状补齐（--official-shape 默认开；2026-10-28 官方 2.177.0 抓包对齐，
+    // 见 auth::apply_official_shape 的字段说明）。
+    if state.official_shape {
+        auth::apply_official_shape(&mut up_body);
+    }
     // 内容审核误拦三层防护（顺序与 codebuddy2openai 一致：先清洗签名，再转义，再脱敏——
     // 后面两层都基于清洗后的 system 文本工作）。
     if state.strip_harness {
         let n = desensitize::strip_harness_body(&mut up_body);
         if n > 0 {
             if let Some(logger) = &state.logger {
-                logger.line(&format!("── strip-harness: 清洗 {n} 处 DeepSeek Harness 签名"));
+                logger.line(&format!("── strip-harness: 清洗 {n} 处签名（含 @-路径段改写）"));
             }
         }
     }
@@ -240,7 +262,19 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         }
     }
     if state.desensitize {
-        desensitize::desensitize_body(&mut up_body);
+        if state.desensitize_scope_all {
+            // dsh 客户端的工具描述/用户笔记里的 dsh/DSH 痕迹是渠道风险分加重因子，
+            // scope=all 时全量打散（真实会话 71 处痕迹可打散 68 处）。
+            desensitize::desensitize_body(&mut up_body, &["system", "user", "assistant", "tool"]);
+            let n = desensitize::desensitize_tools(&mut up_body);
+            if n > 0 {
+                if let Some(logger) = &state.logger {
+                    logger.line(&format!("── desensitize(scope=all): 全角色 + tools 描述改写 {n} 处"));
+                }
+            }
+        } else {
+            desensitize::desensitize_body(&mut up_body, &["system"]);
+        }
     }
 
     // 日志：请求摘要 + 发往后端的完整请求体（脱敏后）。
@@ -250,6 +284,7 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         let tools = messages.as_array().map_or(0, |_| {
             up_body.get("tools").and_then(Value::as_array).map(|t| t.len()).unwrap_or(0)
         });
+        logger.rotate(); // 记录新请求前先裁掉更早的请求现场（保留最近 log_keep 次）
         logger.line(&format!(
             "▶ REQUEST {model} | stream={wants_stream} | msgs={msgs} | tools={tools} | last_user='{last}'",
             msgs = up_body.get("messages").and_then(Value::as_array).map(|m| m.len()).unwrap_or(0),
@@ -257,38 +292,78 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         logger.block("REQUEST BODY", &serde_json::to_string(&up_body).unwrap_or_default());
     }
 
-    // 转发到后端（官方 CLI 形态的请求头，见 auth::chat_headers）
-    let session = match state.auth.session().await {
-        Ok(s) => s,
-        Err(e) => return error_response(401, e),
-    };
-    let mut headers = auth::chat_headers(&session, &model, state.auth.private_data());
-    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-    headers.insert(header::ACCEPT, header::HeaderValue::from_static("text/event-stream"));
+    // 转发到后端（官方 CLI 形态的请求头，见 auth::chat_headers）。
+    // 11128 自愈（对齐 codebuddy2openai）：上游非 200 且响应体含 "11128"（渠道拦截）→
+    // 强刷令牌 + 重建身份头，2s 后重试一次。重试轰炸会推高后端渠道热度，故只重试一次；
+    // 其余错误原样透传（流式响应不受影响——错误响应体是小 JSON，缓冲判断无副作用）。
     let url = format!("{}/v2/chat/completions", auth::BACKEND);
-    let upstream = match state
-        .client
-        .post(&url)
-        .headers(headers)
-        .body(serde_json::to_vec(&up_body).unwrap_or_default())
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return error_response(502, format!("请求 CodeBuddy 后端失败：{e}")),
+    let json_bytes = serde_json::to_vec(&up_body).unwrap_or_default();
+
+    async fn fresh_headers(
+        state: &AppState,
+        model: &str,
+        conversation_id: &str,
+    ) -> Result<HeaderMap, Response> {
+        let session = match state.auth.session().await {
+            Ok(s) => s,
+            Err(e) => return Err(error_response(401, e)),
+        };
+        let mut h = auth::chat_headers(&session, model, state.auth.private_data(), conversation_id);
+        h.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        h.insert(header::ACCEPT, header::HeaderValue::from_static("text/event-stream"));
+        Ok(h)
+    }
+
+    let mut headers = match fresh_headers(&state, &model, &client_conversation_id).await {
+        Ok(h) => h,
+        Err(resp) => return resp,
     };
-    if !upstream.status().is_success() {
-        let status = upstream.status().as_u16();
-        let raw = upstream.text().await.unwrap_or_default();
+    let mut retried_11128 = false;
+    let upstream = loop {
+        let resp = match state
+            .client
+            .post(&url)
+            .headers(headers.clone())
+            .body(json_bytes.clone())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return error_response(502, format!("请求 CodeBuddy 后端失败：{e}")),
+        };
+        if resp.status().as_u16() == 200 {
+            break resp;
+        }
+        // 错误响应体较小，缓冲后判断是否渠道拦截 11128。
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
         if let Some(logger) = &logger {
-            logger.line(&format!("✗ HTTP {status} | {model} | {}", raw.chars().take(200).collect::<String>()));
+            logger.line(&format!(
+                "✗ HTTP {} | {model} | {}",
+                status.as_u16(),
+                raw.chars().take(200).collect::<String>()
+            ));
+            logger.block("ERROR BODY", &raw);
+        }
+        if !retried_11128 && raw.contains("11128") {
+            retried_11128 = true;
+            if let Some(logger) = &logger {
+                logger.line("── 11128 渠道拦截：强刷令牌+换身份头，2s 后重试一次");
+            }
+            state.auth.force_refresh();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            headers = match fresh_headers(&state, &model, &client_conversation_id).await {
+                Ok(h) => h,
+                Err(resp) => return resp,
+            };
+            continue;
         }
         return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(raw))
             .unwrap_or_else(|_| Response::new(Body::empty()));
-    }
+    };
 
     // 流式：逐字节透传 SSE（开启日志时旁路录制完整原始 SSE）
     if wants_stream {

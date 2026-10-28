@@ -25,6 +25,12 @@ pub struct Args {
     pub save_auth: Option<String>,
     /// 一次性动作：把指定文件安装为本机 CodeBuddy 登录文件（服务器上运行），执行后退出。
     pub restore_auth: Option<String>,
+    /// 日志轮转：日志只保留最近 N 次请求的完整现场；0 = 关闭轮转（保留全部）。
+    pub log_keep: usize,
+    /// --desensitize-scope all：脱敏扩展到全部角色消息 + tools 描述（渠道风险分降分）。
+    pub desensitize_scope_all: bool,
+    /// 官方请求形状补齐（默认开）：extra_vars.harnessMetadata 等官方 body 字段。
+    pub official_shape: bool,
 }
 
 impl Default for Args {
@@ -45,6 +51,14 @@ impl Default for Args {
                 .unwrap_or(600),
             save_auth: None,
             restore_auth: None,
+            log_keep: std::env::var("CODEBUDDY2OPENAI_LOG_KEEP")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            desensitize_scope_all: std::env::var("CODEBUDDY2OPENAI_DESENSITIZE_SCOPE")
+                .map(|v| v.trim().eq_ignore_ascii_case("all"))
+                .unwrap_or(false),
+            official_shape: env_switch("CODEBUDDY2OPENAI_OFFICIAL_SHAPE", true),
         }
     }
 }
@@ -66,7 +80,8 @@ fn env_switch(key: &str, default: bool) -> bool {
 }
 
 /// 解析 `--host <ip>` / `--port <n>` / `--api-key <key>` / `--log <path>` /
-/// `--desensitize` / `--user-escape` / `--strip-harness on|off` /
+/// `--desensitize` / `--desensitize-scope system|all` / `--user-escape` /
+/// `--strip-harness on|off` / `--official-shape on|off` / `--log-keep <n>` /
 /// `--private-data true|false` / `--skip-check` / `--models-ttl <secs>` /
 /// `--save-auth <file>` / `--restore-auth <file>`；未知参数忽略。
 pub fn parse() -> Args {
@@ -124,6 +139,23 @@ pub fn parse() -> Args {
             "--restore-auth" => {
                 if let Some(value) = argv.next() {
                     args.restore_auth = Some(value);
+                }
+            }
+            "--log-keep" => {
+                if let Some(value) = argv.next() {
+                    if let Ok(n) = value.parse() {
+                        args.log_keep = n;
+                    }
+                }
+            }
+            "--desensitize-scope" => {
+                if let Some(value) = argv.next() {
+                    args.desensitize_scope_all = value.trim().eq_ignore_ascii_case("all");
+                }
+            }
+            "--official-shape" => {
+                if let Some(value) = argv.next() {
+                    args.official_shape = !value.trim().eq_ignore_ascii_case("off");
                 }
             }
             _ => {}

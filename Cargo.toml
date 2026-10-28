@@ -1,6 +1,6 @@
 [package]
 name = "codebuddy-proxy-rs"
-version = "0.2.1"
+version = "0.2.2"
 description = "CodeBuddy → OpenAI 兼容代理：复用桌面登录态，把任意 OpenAI 客户端的 chat/completions 透传到 CodeBuddy 后端"
 repository = "git+https://github.com/evlon/codebuddy-proxy-rs.git"
 edition = "2021"
@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde_json = "1"
 futures = "0.3"

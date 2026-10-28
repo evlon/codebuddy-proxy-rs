@@ -33,7 +33,10 @@ async fn main() {
         "未找到 CodeBuddy 登录文件；请先在桌面端登录 CodeBuddy / WorkBuddy。",
     );
     let client = reqwest::Client::new();
-    let logger = args.log.as_ref().map(|path| logging::Logger::new(path.into()));
+    let logger = args
+        .log
+        .as_ref()
+        .map(|path| logging::Logger::new(path.into(), args.log_keep));
     let state = Arc::new(AppState::new(
         client,
         auth_file,
@@ -44,6 +47,8 @@ async fn main() {
         args.strip_harness,
         args.private_data,
         args.models_ttl,
+        args.desensitize_scope_all,
+        args.official_shape,
     ));
 
     if args.skip_check {
@@ -82,10 +87,14 @@ async fn main() {
         println!("   鉴权已启用（API key 已设置）");
     }
     if let Some(path) = &args.log {
-        println!("   日志      : {path}");
+        println!("   日志      : {path}（轮转保留最近 {} 次请求；--log-keep 可调，0=不轮转）", args.log_keep);
     }
     if args.desensitize {
-        println!("   脱敏已启用（system 合规词插入零宽空格）");
+        if args.desensitize_scope_all {
+            println!("   脱敏      : 已启用（scope=all：全角色 + tools 描述，渠道风险降分）");
+        } else {
+            println!("   脱敏      : 已启用（system 合规词插入零宽空格；--desensitize-scope all 可扩展）");
+        }
     }
     if args.user_escape {
         println!("   用户转义  : 已启用（[s[...]] 反转编码 + 解码说明）");
@@ -93,6 +102,10 @@ async fn main() {
     if !args.strip_harness {
         println!("   签名清洗  : 已关闭（--strip-harness off）");
     }
+    if !args.official_shape {
+        println!("   官方形状  : 已关闭（--official-shape off）");
+    }
+    println!("   身份面    : 官方 {}（UA/身份头/trace 族/官方 body 形状 + 令牌保鲜 + 11128 自愈）", auth::official_version());
     println!("   隐私标志  : X-Private-Data={}（--private-data 可调）", args.private_data);
     println!("   模型缓存  : {} 秒（--models-ttl 可调）", args.models_ttl);
     axum::serve(listener, app).await.expect("server 退出异常");
