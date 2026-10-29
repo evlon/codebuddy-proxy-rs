@@ -5,6 +5,7 @@ mod desensitize;
 mod handlers;
 mod logging;
 mod models;
+mod scrub;
 
 use std::sync::Arc;
 

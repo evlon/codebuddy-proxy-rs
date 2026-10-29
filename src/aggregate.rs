@@ -85,6 +85,22 @@ pub fn aggregate_to_completion(text: &str, model: &str) -> Value {
         }
     }
 
+    // 响应侧零宽字符清洗（模型回声防护，见 scrub.rs 模块注释）
+    let content = crate::scrub::scrub_zwsp(&content);
+    let reasoning = crate::scrub::scrub_zwsp(&reasoning);
+    for call in tool_calls.values_mut() {
+        if let Some(fn_obj) = call.get_mut("function").and_then(Value::as_object_mut) {
+            if let Some(name) = fn_obj.get("name").and_then(Value::as_str) {
+                let cleaned = crate::scrub::scrub_zwsp(name);
+                fn_obj.insert("name".into(), Value::String(cleaned));
+            }
+            if let Some(args) = fn_obj.get("arguments").and_then(Value::as_str) {
+                let cleaned = crate::scrub::scrub_zwsp(args);
+                fn_obj.insert("arguments".into(), Value::String(cleaned));
+            }
+        }
+    }
+
     let mut message = Map::new();
     message.insert("role".into(), Value::String("assistant".into()));
     // tool_calls-only 的响应 content 用 null（与 codebuddy2openai 一致，客户端更友好）。
@@ -182,5 +198,29 @@ mod tests {
         assert_eq!(message["content"].as_str().unwrap(), "Hi");
         assert_eq!(message["reasoning_content"].as_str().unwrap(), "Let me think. ");
         assert!(completion["usage"]["prompt_tokens"].as_i64().unwrap() == 3);
+    }
+
+    /// 响应侧零宽字符清洗：模型回声的 U+200B 不得进入聚合结果（content/reasoning/参数）。
+    #[test]
+    fn zwsp_echo_is_scrubbed() {
+        let sse = concat!(
+            r#"data: {"choices":[{"index":0,"delta":{"content":"\u5728 d\u200bsh \u76ee\u5f55\u8fd0\u884c"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"index":0,"delta":{"reasoning_content":"\u60f3 d\u200bsh"}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"wri\u200bte","arguments":"{\"path\":\"d"}}]}}]}"#,
+            "\n",
+            r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\u200bsh.txt\"}"}}]}}]}"#,
+            "\n",
+            r#"data: [DONE]"#,
+            "\n",
+        );
+        let completion = aggregate_to_completion(sse, "m");
+        let message = &completion["choices"][0]["message"];
+        assert_eq!(message["content"].as_str().unwrap(), "在 dsh 目录运行");
+        assert_eq!(message["reasoning_content"].as_str().unwrap(), "想 dsh");
+        let tc = &message["tool_calls"][0];
+        assert_eq!(tc["function"]["name"].as_str().unwrap(), "write");
+        assert_eq!(tc["function"]["arguments"].as_str().unwrap(), r#"{"path":"dsh.txt"}"#);
     }
 }

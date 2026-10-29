@@ -1,6 +1,6 @@
 [package]
 name = "codebuddy-proxy-rs"
-version = "0.2.2"
+version = "0.2.3"
 description = "CodeBuddy → OpenAI 兼容代理：复用桌面登录态，把任意 OpenAI 客户端的 chat/completions 透传到 CodeBuddy 后端"
 repository = "git+https://github.com/evlon/codebuddy-proxy-rs.git"
 edition = "2021"

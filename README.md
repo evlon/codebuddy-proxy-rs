@@ -15,7 +15,8 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 - 复用 CodeBuddy 桌面登录态，token 临近过期自动刷新并原子回写
 - 可选 `--api-key` 鉴权（`Authorization: Bearer` 或 `X-Api-Key`）
 - 可选 `--log`：请求 / 原始 SSE 旁路录制（`--log-keep` 自动轮转，默认保留最近 3 次请求现场），便于排查内容审核拦截
-- 可选 `--desensitize`：system 合规词零宽空格脱敏，缓解后端误拦（词表含 `DeepSeek Harness` 竞品签名、`deepseek`/`dsh`）；`--desensitize-scope all` 扩展到全部角色消息与 tools 描述
+- 可选 `--desensitize`：system 合规词零宽空格脱敏，缓解后端误拦（词表含 `DeepSeek Harness` 竞品签名、`deepseek`/`dsh`）；`--desensitize-scope all` 扩展到全部角色消息与 tools 描述（2026-10-29 复测：`scope=system` 默认即可全量放行，`all` 仅作旁路备份——且勿滥用，工具描述打码会让模型把零宽字符回声进输出）
+- **响应侧零宽字符清洗**：流式 SSE 逐行解析-清洗-重序列化、非流式聚合统一去掉模型回声的 U+200B（打码拼写的副作用被模型照抄进正文/命令/文件时，不再落进客户端输出）
 - 可选 `--user-escape`：user 消息敏感术语转义（`[s[<逐字反转>]]` + 自动补解码说明）
 - 默认开 `--strip-harness`：清洗 system 里 dsh 三段全局签名与 @-路径语义段（`DeepSeek Harness` 字面量与该段落均为后端 `11128` 渠道拦截的确定性匹配串），并清洗 assistant 历史残留签名
 - `--save-auth` / `--restore-auth`：把本机登录态一键迁移到服务器
@@ -30,7 +31,7 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
             GET  /v3/config（动态模型目录）
 ```
 
-- 透传时强制 `stream=true`：客户端要流式则逐字节透传 SSE；非流式则在后端流结束后聚合为单个 completion。
+- 透传时强制 `stream=true`：客户端要流式则逐行解析 SSE、清洗 U+200B 后重序列化转发；非流式则在后端流结束后聚合为单个 completion（同样清洗）。
 - 模型列表来自后端 `/v3/config`（与官方 CLI 登录后拉取产品配置同一接口），`--models-ttl` 控制缓存秒数（默认 600，`0` = 每次实时拉取，`?refresh=1` 强制刷新）。
 - 出站请求头为官方 CLI 形态（UA 等，详见下方「降低风控识别」）。
 - 登录文件仅本机可写（导入/导出自动 `chmod 600`，非 Windows）。

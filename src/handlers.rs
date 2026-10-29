@@ -1,7 +1,8 @@
 /// OpenAI 兼容的 HTTP 面：`/health`、`/v1/models`（动态）、`/v1/models/{id}`、`/v1/chat/completions`。
 ///
-/// 聊天请求原样透传到 CodeBuddy 后端（仅强制 `stream=true`）；客户端要流式就逐字节
-/// 透传 SSE（可选旁路录制到日志），要非流式则在后端流结束后聚合为单个 completion。
+/// 聊天请求原样透传到 CodeBuddy 后端（仅强制 `stream=true`）；客户端要流式就逐行解析 SSE、
+/// 清洗 U+200B（模型回声防护，见 `scrub.rs`）后重序列化转发（可选旁路录制到日志），
+/// 要非流式则在后端流结束后聚合为单个 completion。
 /// 模型列表动态拉取官方 `/v3/config`（与官方 CLI `/model` 选择器同源），并附上下文
 /// 窗口元数据，便于客户端做压缩/截断决策、避免上下文溢出。
 
@@ -370,7 +371,9 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         let mapped = upstream
             .bytes_stream()
             .map(|item| item.map_err(|e| std::io::Error::other(e)));
-        let stream = logging::Tee::new(mapped, logger);
+        // 响应侧零宽字符清洗：逐行解析-清洗 U+200B-重序列化（模型回声防护，见 scrub.rs）
+        let scrubbed = crate::scrub::SseScrubStream::new(mapped);
+        let stream = logging::Tee::new(scrubbed, logger);
         return Response::builder()
             .status(200)
             .header(header::CONTENT_TYPE, "text/event-stream")
