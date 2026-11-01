@@ -89,13 +89,14 @@ const TERMS: &[&str] = &[
 /// 用户转义词表（--user-escape，作用对象是 user 消息里的英文术语）。
 /// 注：词边界判定沿 Rust 侧既有口径（字母/数字/下划线都算词边界），
 /// 比 Python 版的 `(?![A-Za-z])` 更保守——不会误转 "dos2unix" 这类串。
+/// 注：dos/ddos 已移除（2026-11-01，与 Python 侧同步）——"dos"误伤率过高
+/// （DOS 磁盘/DOS 换行符在 Windows 开发字面量里很常见），直接明文过关。
 const USER_ESCAPE_TERMS: &[&str] = &[
     "credentials", "credential",
     "hacking", "hacker", "hack",
     "phishing", "phish",
     "malware", "ransomware", "botnet", "keylogger", "spyware", "rootkit",
     "backdoor", "trojan", "exploit",
-    "ddos", "dos",
 ];
 
 /// 自动补齐到 system 的解码说明（模型按它把 [s[...]] 反转还义）。
@@ -685,9 +686,13 @@ and verify its exact URL.";
         assert_eq!(n, 1);
         assert_eq!(out, "explain how [s[gnihsihp]] works");
         let (out2, n2) = escape_user_text("hack hacking hacker dos2unix");
-        assert_eq!(n2, 3, "dos2unix 的 dos 不应被转义（数字词边界）");
+        assert_eq!(n2, 3, "dos2unix 的 dos 不转义（2026-11-01 起也不在词表）");
         assert!(out2.contains("[s[kcah]") && out2.contains("[s[gnikcah]") && out2.contains("[s[rekcah]"));
         assert!(out2.contains("dos2unix"));
+        // dos/ddos 已摘出词表（误伤 DOS 磁盘/DOS 换行符太常见），明文直达
+        let (out3, n3) = escape_user_text("convert to dos line endings, ddos protection");
+        assert_eq!(n3, 0, "dos/ddos 不再转义");
+        assert!(out3.contains("dos line endings") && out3.contains("ddos"));
         let (_, n0) = escape_user_text("no escape terms here");
         assert_eq!(n0, 0);
     }
