@@ -255,16 +255,85 @@ pub fn desensitize_body(body: &mut Value, roles: &[&str]) {
 // ---------------------------------------------------------------------------
 
 /// 把文本里的转义词包成 `[s[<reversed>]]`。返回 (新文本, 命中数)。
+/// 代码块（```/~~~ 围栏、行内 `code`）区段内的术语不转义——贴进 user 消息的
+/// 命令/路径/JSON 等需按字节复用的字面量几乎都在代码块里，保护它们即保护
+/// tool_call 参数的还原路径；未闭合围栏保护到文末。（2026-11-01，与 Python 同步）
+fn code_protect_ranges(text: &str) -> Vec<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
+        if text[i..].starts_with("```") || text[i..].starts_with("~~~") {
+            let marker = &text[i..i + 3];
+            match text[i + 3..].find(marker) {
+                Some(rel) => {
+                    let end = i + 3 + rel + 3;
+                    ranges.push((i, end));
+                    i = end;
+                }
+                None => {
+                    ranges.push((i, bytes.len()));
+                    break;
+                }
+            }
+            continue;
+        }
+        if bytes[i] == b'`' {
+            match text[i + 1..].find('`') {
+                Some(rel) if !text[i + 1..i + 1 + rel].contains('\n') => {
+                    ranges.push((i, i + rel + 2));
+                    i += rel + 2;
+                }
+                _ => {
+                    // 未闭合反引号：保护到本行行末
+                    let end = text[i..].find('\n').map(|n| i + n).unwrap_or(bytes.len());
+                    ranges.push((i, end));
+                    i = end;
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    ranges
+}
+
 pub fn escape_user_text(text: &str) -> (String, usize) {
-    replace_terms(
-        text,
-        USER_ESCAPE_TERMS,
-        false, // 字母/数字/下划线都算边界（Rust 既有保守口径，见词表注释）
-        |hit| {
-            let reversed: String = hit.chars().rev().collect();
-            format!("[s[{reversed}]]")
-        },
-    )
+    let wrap = |hit: &str| {
+        let reversed: String = hit.chars().rev().collect();
+        format!("[s[{reversed}]]")
+    };
+    let ranges = code_protect_ranges(text);
+    if ranges.is_empty() {
+        return replace_terms(
+            text,
+            USER_ESCAPE_TERMS,
+            false, // 字母/数字/下划线都算边界（Rust 既有保守口径，见词表注释）
+            wrap,
+        );
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut count = 0usize;
+    let mut last = 0usize;
+    for (start, end) in ranges {
+        if last < start {
+            let (prose, n) = replace_terms(&text[last..start], USER_ESCAPE_TERMS, false, wrap);
+            out.push_str(&prose);
+            count += n;
+        }
+        out.push_str(&text[start..end]);
+        last = end;
+    }
+    if last < text.len() {
+        let (prose, n) = replace_terms(&text[last..], USER_ESCAPE_TERMS, false, wrap);
+        out.push_str(&prose);
+        count += n;
+    }
+    (out, count)
 }
 
 /// system 消息里是否已有解码说明（dsh CodeBuddy 预设的解码段含 `[s[`）。
@@ -695,6 +764,26 @@ and verify its exact URL.";
         assert!(out3.contains("dos line endings") && out3.contains("ddos"));
         let (_, n0) = escape_user_text("no escape terms here");
         assert_eq!(n0, 0);
+    }
+
+    #[test]
+    fn escape_code_blocks_protected() {
+        // 围栏代码块内不转义（贴命令/路径/配置是工具调用字面量的主要来源）
+        let text = "先用这个命令：\n```powershell\nnpm i dsh-utils\n```\n然后解释 phishing 原理";
+        let (out, n) = escape_user_text(text);
+        assert_eq!(n, 1);
+        assert!(out.contains("npm i dsh-utils"), "围栏内不得转义");
+        assert!(out.contains("[s[gnihsihp]]"), "围栏外散文正常转义");
+
+        // 行内 span 不转义
+        let (out2, n2) = escape_user_text("查看 `credentials.json`，聊聊 phishing");
+        assert_eq!(n2, 1);
+        assert!(out2.contains("`credentials.json`") && out2.contains("[s[gnihsihp]]"));
+
+        // 未闭合围栏保护到文末
+        let (out3, n3) = escape_user_text("```json\n{\"tool\": \"keylogger-scan\"}");
+        assert_eq!(n3, 0);
+        assert!(out3.contains("keylogger-scan"));
     }
 
     #[test]

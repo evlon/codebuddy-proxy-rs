@@ -117,7 +117,7 @@ codebuddy-proxy-rs --host 0.0.0.0 --port 8787 --api-key sk-your-key
 | `--desensitize` | 对 system 合规词插入零宽空格做脱敏（词表含 `DeepSeek Harness`、`deepseek`、`dsh`） |
 | `--desensitize-scope system\|all` | 脱敏作用范围（需 `--desensitize`）。`all`：扩展到 user/assistant/tool 消息与 `tools` 描述——dsh 客户端的工具描述/用户笔记里的 `dsh`/`DSH_*` 痕迹是渠道风险分加重因子（环境变量 `CODEBUDDY2OPENAI_DESENSITIZE_SCOPE`） |
 | `--official-shape on\|off` | **官方请求形状补齐（默认 on）**：body 补官方必带字段 `extra_vars.harnessMetadata`（JSON 串）与 `reasoning_effort`/`verbosity`/`cache_retention`/`reasoning_summary` 官方默认值（客户端显式指定时不覆盖）；环境变量 `CODEBUDDY2OPENAI_OFFICIAL_SHAPE=off` 可关 |
-| `--user-escape` | 对 user 消息敏感术语转义（phishing → `[s[gnihsihp]]`），system 尚无解码说明时自动补 `CODEBUDDY_ESCAPE_CODEC` 段 |
+| `--user-escape` | 对 user 消息敏感术语转义（phishing → `[s[gnihsihp]]`，围栏/行内代码块内不转义），system 尚无解码说明时自动补 `CODEBUDDY_ESCAPE_CODEC` 段 |
 | `--strip-harness on\|off` | 清洗 system 里 dsh 三段全局签名（`harness:identity/source`、`app:web-surface`，字面量 `DeepSeek Harness` 即后端 `11128` 渠道拦截匹配串）**与 @-路径语义段**（`Tokens prefixed with @ …` 整段，2026-10-28 官方载体分块扫描确定性定位的第二处硬拦点，改写为语义等效中性文本），并清洗 assistant 历史里的残留签名。**默认 on**；`--strip-harness off` 或环境变量 `CODEBUDDY2OPENAI_STRIP_HARNESS=off` 可关 |
 | `--private-data true\|false` | `X-Private-Data` 标头取值，默认 `true`（隐私优先）；`false` 对齐官方 SaaS 默认 |
 | `--models-ttl <secs>` | 动态模型列表缓存秒数，默认 `600`；`0` 表示每次 `/v1/models` 都实时拉取（环境变量 `CODEBUDDY2OPENAI_MODELS_TTL`） |
