@@ -80,6 +80,8 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 
 代理会扫描该目录下第一个 `*.info`。请先在桌面端登录 CodeBuddy / WorkBuddy。
 
+> **2026-11 桌面端 1.106.1 注意**：新版桌面端把 IDE 登录态收进了 VS Code 式 SecretStorage（`%APPDATA%\CodeBuddy CN\User\globalStorage\state.vscdb` 加密条目），桌面端自身不再往上述路径写 `.info`，在桌面端重新登录**不会**让文件回来。恢复办法：跑一次官方 CLI（`pwsh -NoProfile -File <node目录>\codebuddy.ps1`）并完成登录，CLI 会把完整凭据写回老路径（实测 2026-11-02）；代理的自动刷新会持续把续期结果回写该文件。也可用本仓库 `scripts/export_auth_from_ide.py` 直接解密 IDE SecretStorage 组装 `.info`（不依赖 CLI：`python -X utf8 scripts/export_auth_from_ide.py`，先 `--dry-run` 预览，已存在需 `--force`）。
+
 ## 快速开始
 
 ### 方式一：下载 Release 二进制
