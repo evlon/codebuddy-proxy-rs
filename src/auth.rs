@@ -33,14 +33,14 @@ const DEFAULT_DOMAIN: &str = "www.codebuddy.cn";
 /// 环境变量：CODEBUDDY2OPENAI_UA 整条覆盖；CODEBUDDY2OPENAI_UA_VERSION 覆盖版本号；
 /// 其余分段走 CLIENT_INFO_* 身份字段通道（见 identity_env）。
 
-/// 与官方 CLI 对齐的版本号（2026-10-28 官方 2.177.0 抓包实测：npm
-/// @tencent-ai/codebuddy-code 2.177.0，UA 形态 `CLI/2.177.0 CodeBuddy/2.177.0`；
+/// 与官方 CLI 对齐的版本号（2026-11-07 官方 2.181.0 抓包实测：npm
+/// @tencent-ai/codebuddy-code 2.181.0，UA 形态 `CLI/2.181.0 CodeBuddy/2.181.0`；
 /// 可用环境变量 CODEBUDDY2OPENAI_UA_VERSION 覆盖）。
 pub fn official_version() -> String {
     env::var("CODEBUDDY2OPENAI_UA_VERSION")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "2.177.0".into())
+        .unwrap_or_else(|| "2.181.0".into())
 }
 
 pub fn build_user_agent() -> String {
@@ -483,9 +483,11 @@ impl Auth {
     }
 }
 
-/// 官方请求形状补齐（--official-shape 默认开；2026-10-28 官方 2.177.0 抓包对齐）：
+/// 官方请求形状补齐（--official-shape 默认开；2026-11-07 官方 2.181.0 抓包对齐）：
 /// - extra_vars.harnessMetadata：官方客户端必带的 JSON 串（harnessVersion/stepIndex/
 ///   contextWindowId/agent.depth），缺失属于"非官方客户端"特征，推高渠道风险分；
+/// - interactionType:"prompt"（2026-11-07 官方 2.181.0 抓包：首轮请求必带，
+///   turn≥2 续轮官方只带 harnessMetadata，不影响本代理"每请求独立"的形态）；
 /// - reasoning_effort/verbosity/cache_retention/reasoning_summary：官方默认值，
 ///   客户端显式指定时不覆盖。
 pub fn apply_official_shape(body: &mut Value) {
@@ -503,6 +505,7 @@ pub fn apply_official_shape(body: &mut Value) {
             json!({
                 "harnessMetadata": serde_json::to_string(&harness_metadata).unwrap_or_default(),
                 "initiator": "user",
+                "interactionType": "prompt",
             }),
         );
     }
@@ -652,6 +655,7 @@ mod tests {
         apply_official_shape(&mut body);
         let ev = &body["extra_vars"];
         assert_eq!(ev["initiator"], "user");
+        assert_eq!(ev["interactionType"], "prompt");
         let hm: Value = serde_json::from_str(ev["harnessMetadata"].as_str().unwrap())
             .expect("harnessMetadata 应为 JSON 字符串");
         assert_eq!(hm["schemaVersion"], 1);

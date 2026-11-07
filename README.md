@@ -11,7 +11,7 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 - OpenAI 兼容 HTTP 面：`/v1/models`（动态）、`/v1/models/{model}`、`/v1/chat/completions`（流式 / 非流式）
 - **动态模型列表**：实时调用官方 CLI 同款 `GET /v3/config`，取 `agents["cli"].models`（官方 `/model` 选择器同款可用列表），TTL 缓存 + 失败兜底（上次成功结果 → 内置快照）
 - **上下文窗口元数据**：`/v1/models` 每项附 `max_input_tokens` / `context_length` / `max_output_tokens`（`/v1/models/{id}` 再附 vLLM / LM Studio 风格别名与后端原始元数据），客户端可据此做压缩/截断决策、避免上下文溢出
-- **官方 CLI 请求指纹**：出站请求头模拟官方客户端 2.177.0（UA / X-Product / X-Request-ID / X-IDE / X-Agent / trace 族 / X-Conversation 族），body 补官方形状字段（`extra_vars.harnessMetadata` 等，`--official-shape` 默认开）；token 临近过期（<6h）自动刷新并原子回写；收到 `11128` 渠道拦截自动强刷令牌+换身份头重试一次（见下方「降低风控识别」）
+- **官方 CLI 请求指纹**：出站请求头模拟官方客户端 2.181.0（UA / X-Product / X-Request-ID / X-IDE / X-Agent / trace 族 / X-Conversation 族），body 补官方形状字段（`extra_vars.harnessMetadata` 等，`--official-shape` 默认开）；token 临近过期（<6h）自动刷新并原子回写；收到 `11128` 渠道拦截自动强刷令牌+换身份头重试一次（见下方「降低风控识别」）
 - 复用 CodeBuddy 桌面登录态，token 临近过期自动刷新并原子回写
 - 可选 `--api-key` 鉴权（`Authorization: Bearer` 或 `X-Api-Key`）
 - 可选 `--log`：请求 / 原始 SSE 旁路录制（`--log-keep` 自动轮转，默认保留最近 3 次请求现场），便于排查内容审核拦截
@@ -38,11 +38,11 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 
 ## 降低风控识别（请求指纹模拟）
 
-早期版本自报 `User-Agent: codebuddy-proxy-rs/0.1.0`，等于在请求头里写明"我是第三方转换器"——后端确实按 UA 做画像与校验（逆向官方客户端 + 实测证实）。现改为**完整模拟官方 CLI（@tencent-ai/codebuddy-code 2.177.0，2026-10-28 官方请求抓包逐字对齐）的请求指纹**（与 codebuddy2openai 的身份面对齐）：
+早期版本自报 `User-Agent: codebuddy-proxy-rs/0.1.0`，等于在请求头里写明"我是第三方转换器"——后端确实按 UA 做画像与校验（逆向官方客户端 + 实测证实）。现改为**完整模拟官方 CLI（@tencent-ai/codebuddy-code 2.181.0，2026-11-07 官方请求抓包逐字对齐）的请求指纹**（与 codebuddy2openai 的身份面对齐）：
 
 | 出站请求 | 模拟的头 |
 |---|---|
-| 所有请求 | `User-Agent: CLI/2.177.0 CodeBuddy/2.177.0`、`X-Product: SaaS`、`X-Product-Version`、`X-IDE-Type: CLI`、`X-IDE-Name: CLI`、`X-IDE-Version`、`X-Request-ID`（每请求新生成 32 位 hex）、`X-Private-Data`（默认 `true`，`--private-data false` 对齐官方 SaaS 默认）、`X-Requested-With: XMLHttpRequest`、`X-CodeBuddy-Request: 1` |
+| 所有请求 | `User-Agent: CLI/2.181.0 CodeBuddy/2.181.0`、`X-Product: SaaS`、`X-Product-Version`、`X-IDE-Type: CLI`、`X-IDE-Name: CLI`、`X-IDE-Version`、`X-Request-ID`（每请求新生成 32 位 hex）、`X-Private-Data`（默认 `true`，`--private-data false` 对齐官方 SaaS 默认）、`X-Requested-With: XMLHttpRequest`、`X-CodeBuddy-Request: 1` |
 | `POST /v2/chat/completions` | 基础头 + `X-Agent-Intent: craft`、`X-Agent-Runtime: other`（抓包实测）、`X-Agent-Type: main`、`X-Agent-Purpose: conversation`、`X-Model-ID`、`X-Trace-ID`、`X-Conversation-ID` / `X-Root-Request-ID`（独立根 UUID）/ `X-Conversation-Request-ID` / `X-Conversation-Message-ID`、trace 族（`traceparent` / `b3` / `X-B3-*` / `baggage`，每请求新生成） |
 | `GET /v3/config` | 基础头（该接口对 UA 有硬校验：缺 `CodeBuddy/<版本>` 段直接 400 code=12403；缺 `CLI/<x>` 段则 200 但不下发模型数据） |
 
