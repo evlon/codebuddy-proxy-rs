@@ -50,6 +50,9 @@ async fn main() {
         args.models_ttl,
         args.desensitize_scope_all,
         args.official_shape,
+        args.retry_11128,
+        args.retry_11128_delay,
+        args.retry_11128_max,
     ));
 
     if args.skip_check {

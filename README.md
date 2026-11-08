@@ -11,14 +11,14 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 - OpenAI 兼容 HTTP 面：`/v1/models`（动态）、`/v1/models/{model}`、`/v1/chat/completions`（流式 / 非流式）
 - **动态模型列表**：实时调用官方 CLI 同款 `GET /v3/config`，取 `agents["cli"].models`（官方 `/model` 选择器同款可用列表），TTL 缓存 + 失败兜底（上次成功结果 → 内置快照）
 - **上下文窗口元数据**：`/v1/models` 每项附 `max_input_tokens` / `context_length` / `max_output_tokens`（`/v1/models/{id}` 再附 vLLM / LM Studio 风格别名与后端原始元数据），客户端可据此做压缩/截断决策、避免上下文溢出
-- **官方 CLI 请求指纹**：出站请求头模拟官方客户端 2.181.0（UA / X-Product / X-Request-ID / X-IDE / X-Agent / trace 族 / X-Conversation 族），body 补官方形状字段（`extra_vars.harnessMetadata` 等，`--official-shape` 默认开）；token 临近过期（<6h）自动刷新并原子回写；收到 `11128` 渠道拦截自动强刷令牌+换身份头重试一次（见下方「降低风控识别」）
+- **官方 CLI 请求指纹**：出站请求头模拟官方客户端 2.181.0（UA / X-Product / X-Request-ID / X-IDE / X-Agent / trace 族 / X-Conversation 族），body 补官方形状字段（`extra_vars.harnessMetadata` 等，`--official-shape` 默认开）；token 临近过期（<6h）自动刷新并原子回写；收到 `11128` 渠道拦截自动强刷令牌+换身份头递增冷却重试（`--retry-11128`，默认 60s×序号、最多 3 次，见下方「降低风控识别」）
 - 复用 CodeBuddy 桌面登录态，token 临近过期自动刷新并原子回写
 - 可选 `--api-key` 鉴权（`Authorization: Bearer` 或 `X-Api-Key`）
 - 可选 `--log`：请求 / 原始 SSE 旁路录制（`--log-keep` 自动轮转，默认保留最近 3 次请求现场），便于排查内容审核拦截
-- 可选 `--desensitize`：system 合规词零宽空格脱敏，缓解后端误拦（词表含 `DeepSeek Harness` 竞品签名、`deepseek`/`dsh`）；`--desensitize-scope all` 扩展到全部角色消息与 tools 描述（2026-10-29 复测：`scope=system` 默认即可全量放行，`all` 仅作旁路备份——且勿滥用，工具描述打码会让模型把零宽字符回声进输出）
+- 可选 `--desensitize`：system/developer 合规词零宽空格脱敏，缓解后端误拦（词表含 `DeepSeek Harness` 竞品签名、`deepseek`/`dsh`；dsh 0.2.x 起身份签名段走 `role=developer`，developer 与 system 同待遇，2026-11-07 实测）；`--desensitize-scope all` 扩展到全部角色消息与 tools 描述（2026-10-29 复测：`scope=system` 默认即可全量放行，`all` 仅作旁路备份——且勿滥用，工具描述打码会让模型把零宽字符回声进输出）
 - **响应侧零宽字符清洗**：流式 SSE 逐行解析-清洗-重序列化、非流式聚合统一去掉模型回声的 U+200B（打码拼写的副作用被模型照抄进正文/命令/文件时，不再落进客户端输出）
 - 可选 `--user-escape`：user 消息敏感术语转义（`[s[<逐字反转>]]` + 自动补解码说明）
-- 默认开 `--strip-harness`：清洗 system 里 dsh 三段全局签名与 @-路径语义段（`DeepSeek Harness` 字面量与该段落均为后端 `11128` 渠道拦截的确定性匹配串），并清洗 assistant 历史残留签名
+- 默认开 `--strip-harness`：清洗 system/**developer** 里 dsh 三段全局签名与 @-路径语义段（`DeepSeek Harness` 字面量与该段落均为后端 `11128` 渠道拦截的确定性匹配串；dsh 0.2.x 起三段从 system 改挂 `role=developer`，2026-11-07 实测），**出站前把 `role=developer` 消息并入 system**（实测 2026-11-08：后端按 developer 角色本身拦截 11128，与内容无关；内容清洗成官方签名照拦），并清洗 assistant 历史残留签名
 - `--save-auth` / `--restore-auth`：把本机登录态一键迁移到服务器
 - 单一静态二进制，无需运行时
 
@@ -62,10 +62,11 @@ Rust 实现的 **CodeBuddy → OpenAI 兼容** 代理。读取本机 CodeBuddy /
 
 后端在模型推理之前做渠道风控 + 内容审核，机理为**动态累计评分 + 确定性字面量两层**（2026-10-28 官方载体分块扫描定性，详见 codebuddy2openai 仓库）：
 
-1. **竞品签名（确定性字面量）**：system/assistant 历史里出现字面量 `DeepSeek Harness`（dsh 客户端三段全局段落的签名）→ HTTP 400 `code=11128` "Illegal API invocation from an unapproved channel"。`--strip-harness`（默认开）把三段签名清洗掉：identity 段改写为 `You are CodeBuddy Code.`、source 段删除、web-surface 段替换为中性等效文本，残留变体兜底替换为 `CodeBuddy`；
+1. **竞品签名（确定性字面量）**：system/developer/assistant 历史里出现字面量 `DeepSeek Harness`（dsh 客户端三段全局段落的签名；**dsh 0.2.x 起三段从 system 改挂 `role=developer`，只清 system 挡不住，2026-11-07 实测修复**）→ HTTP 400 `code=11128` "Illegal API invocation from an unapproved channel"。`--strip-harness`（默认开）把三段签名清洗掉：identity 段改写为 `You are CodeBuddy Code.`、source 段删除、web-surface 段替换为中性等效文本，残留变体兜底替换为 `CodeBuddy`；
+1b. **结构层（2026-11-08 实测，新发现）**：后端对**含 `role=developer` 消息的请求**直接 11128，**与内容无关**——developer 内容清洗成官方签名 `You are CodeBuddy Code.` 后仍四连拦（30/60/120/180s 冷却重试全拦），去掉该消息或同内容换 `role=system` 立即放行 → `--strip-harness`（默认开）出站前把 developer 消息**并入 system**（OpenAI 语义等价：developer 本就是系统级指令；无 system 时第一条 developer 提升为 system）；
 2. **@-路径语义段（确定性字面量）**：dsh 预设里 `Tokens prefixed with @ … quotes a path containing spaces.` 一段是第二处硬拦点（官方载体分块扫描：预设其余部分全部放行，仅此段被拦；整段改写为语义等效中性文本后官方载体/真实流量全通过）——同样由 `--strip-harness`（默认开）处理；
 3. **合规模板词**：客户端合规模板里的"拒绝作恶"词汇（DoS/exploit/credential…）被误判 → `--desensitize` 插零宽空格；
-4. **评分/热度**：外来 prompt 痕迹（dsh/DSH 产品名等）与客户端形态偏离累计推高风险分；**每次 11128 都会推高账户热度、降低后续阈值**（衰减以小时计，官方成功请求/token 刷新都不重置）→ 被拦后不要高频重试；代理内置的 11128 处理是"强刷令牌 + 换身份头，2s 后重试一次"即止。dsh 用户建议 `--desensitize --desensitize-scope all` 全量打散痕迹；
+4. **评分/热度冷却**：外来 prompt 痕迹（dsh/DSH 产品名等）与客户端形态偏离累计推高风险分；**11128 触发后是按账号滚动的渠道热度/冷却窗口（2026-11-07 实测定性）**：同一被拦请求体约 1 小时后可原样放行，期间内容变量（历史二分/工具表/`max_tokens`）逐一对照实验均放行——**触发后与单条请求内容无关，只随时间冷却**；立即重试只会继续加热。代理内置的 11128 处理：强刷令牌 + 换身份头，递增冷却重试（默认 60s×序号、最多 3 次，`--retry-11128-delay`/`--retry-11128-max` 可调，`--retry-11128 off` 退化为一次 2s 快速重试）。被拦时不要在外层高频重试；dsh 用户建议 `--desensitize`（默认 scope=system 即可，developer 已默认包含）；
 5. **用户措辞**：user 消息里的安全术语被拦 → `--user-escape` 包成 `[s[<逐字反转>]]` 并自动补解码说明，模型自行反转还义。
 
 与 [codebuddy2openai]（Python 版）语义一致（`cargo test` 内含与真实 dsh 签名文本的对照用例），可与其共享 dsh CodeBuddy 预设（双层防护互不冲突、幂等）。
@@ -116,11 +117,14 @@ codebuddy-proxy-rs --host 0.0.0.0 --port 8787 --api-key sk-your-key
 | `--api-key <key>` | 客户端须携带的 API key；空则不校验 |
 | `--log <path>` | 请求 / 原始 SSE 日志文件 |
 | `--log-keep <n>` | 日志轮转：只保留最近 N 次请求的完整现场（默认 `3`，`0` = 不轮转；环境变量 `CODEBUDDY2OPENAI_LOG_KEEP`） |
-| `--desensitize` | 对 system 合规词插入零宽空格做脱敏（词表含 `DeepSeek Harness`、`deepseek`、`dsh`） |
+| `--desensitize` | 对 system/developer 合规词插入零宽空格做脱敏（词表含 `DeepSeek Harness`、`deepseek`、`dsh`；dsh 0.2.x 起身份签名段走 `role=developer`，developer 与 system 同待遇） |
 | `--desensitize-scope system\|all` | 脱敏作用范围（需 `--desensitize`）。`all`：扩展到 user/assistant/tool 消息与 `tools` 描述——dsh 客户端的工具描述/用户笔记里的 `dsh`/`DSH_*` 痕迹是渠道风险分加重因子（环境变量 `CODEBUDDY2OPENAI_DESENSITIZE_SCOPE`） |
 | `--official-shape on\|off` | **官方请求形状补齐（默认 on）**：body 补官方必带字段 `extra_vars.harnessMetadata`（JSON 串）与 `reasoning_effort`/`verbosity`/`cache_retention`/`reasoning_summary` 官方默认值（客户端显式指定时不覆盖）；环境变量 `CODEBUDDY2OPENAI_OFFICIAL_SHAPE=off` 可关 |
 | `--user-escape` | 对 user 消息敏感术语转义（phishing → `[s[gnihsihp]]`，围栏/行内代码块内不转义），system 尚无解码说明时自动补 `CODEBUDDY_ESCAPE_CODEC` 段 |
-| `--strip-harness on\|off` | 清洗 system 里 dsh 三段全局签名（`harness:identity/source`、`app:web-surface`，字面量 `DeepSeek Harness` 即后端 `11128` 渠道拦截匹配串）**与 @-路径语义段**（`Tokens prefixed with @ …` 整段，2026-10-28 官方载体分块扫描确定性定位的第二处硬拦点，改写为语义等效中性文本），并清洗 assistant 历史里的残留签名。**默认 on**；`--strip-harness off` 或环境变量 `CODEBUDDY2OPENAI_STRIP_HARNESS=off` 可关 |
+| `--strip-harness on\|off` | 清洗 system/**developer** 里 dsh 三段全局签名（`harness:identity/source`、`app:web-surface`，字面量 `DeepSeek Harness` 即后端 `11128` 渠道拦截匹配串；dsh 0.2.x 起三段挂 `role=developer`），**并把 `role=developer` 消息并入 system**（实测 2026-11-08：后端按 developer 角色本身拦截 11128，与内容无关；无 system 时第一条 developer 提升为 system）**与 @-路径语义段**（`Tokens prefixed with @ …` 整段，2026-10-28 官方载体分块扫描确定性定位的第二处硬拦点，改写为语义等效中性文本），并清洗 assistant 历史里的残留签名。**默认 on**；`--strip-harness off` 或环境变量 `CODEBUDDY2OPENAI_STRIP_HARNESS=off` 可关（不建议——developer 并入也随之一并关） |
+| `--retry-11128 on\|off` | 11128 冷却自愈（默认 on）：渠道拦截时强刷令牌+换身份头，按 `--retry-11128-delay`×重试序号递增冷却重试、最多 `--retry-11128-max` 次（默认 60s/120s/240s，期间客户端挂起）。实测 2026-11-07：11128 是按账号滚动的渠道热度/冷却机制，同一被拦请求体约 1 小时后可原样放行；`off` 退化为一次 2s 快速重试（环境变量 `CODEBUDDY2OPENAI_RETRY_11128`） |
+| `--retry-11128-delay <secs>` | 冷却重试基础间隔秒数（默认 `60`；环境变量 `CODEBUDDY2OPENAI_RETRY_11128_DELAY`） |
+| `--retry-11128-max <n>` | 冷却重试最大次数（默认 `3`；环境变量 `CODEBUDDY2OPENAI_RETRY_11128_MAX`） |
 | `--private-data true\|false` | `X-Private-Data` 标头取值，默认 `true`（隐私优先）；`false` 对齐官方 SaaS 默认 |
 | `--models-ttl <secs>` | 动态模型列表缓存秒数，默认 `600`；`0` 表示每次 `/v1/models` 都实时拉取（环境变量 `CODEBUDDY2OPENAI_MODELS_TTL`） |
 | `--skip-check` | 跳过启动账号预检 |

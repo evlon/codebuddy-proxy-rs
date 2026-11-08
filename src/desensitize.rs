@@ -21,7 +21,7 @@
 ///
 /// 保守原则不变：只改固定词表/固定签名段，不做有害输入绕行。
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const ZWSP: char = '\u{200b}';
 
@@ -543,16 +543,19 @@ pub fn strip_harness_text(text: &str) -> (String, usize) {
 
 /// 对请求体做签名清洗（就地修改）。返回改写数。
 ///
-/// system 做**全套**清洗（identity 改写 / source 删除 / web-surface 换中性文本 /
-/// 残留兜底）；assistant 历史只做**残留兜底**（`Deep[ \t]*Seek[ \t]+Harness` →
+/// system/developer 做**全套**清洗（identity 改写 / source 删除 / web-surface 换中性
+/// 文本 / 残留兜底）；assistant 历史只做**残留兜底**（`Deep[ \t]*Seek[ \t]+Harness` →
 /// `CodeBuddy`，任意大小写）——实测 2026-10-28：模型在 dsh persona 时期的自我
 /// 介绍（"我是由 DeepSeek Harness 驱动的…"）会被存进会话历史，续聊回放时照样
 /// 触发 11128——只清 system 挡不住历史包袱。历史里只做残留替换，语义无害且与
 /// 人设一致。user/tool 等其它角色不动。
+///
+/// developer 角色必须清洗（实测 2026-11-07）：dsh 0.2.x 起把 identity/source/
+/// web-surface 三段签名从 system 搬进了 role=developer 消息——只清 system 挡不住。
 pub fn strip_harness_body(body: &mut Value) -> usize {
     let mut count = 0;
-    edit_body(body, &["system", "assistant"], &mut |role, s| {
-        if role == "system" {
+    edit_body(body, &["system", "developer", "assistant"], &mut |role, s| {
+        if role == "system" || role == "developer" {
             let (out, n) = strip_harness_text(s);
             count += n;
             out
@@ -563,6 +566,114 @@ pub fn strip_harness_body(body: &mut Value) -> usize {
         }
     });
     count
+}
+
+// ---------------------------------------------------------------------------
+// 3.5) developer 消息并入 system（--strip-harness 管线第一步）
+// ---------------------------------------------------------------------------
+
+/// 取 content（字符串或 [{type:"text",text}, ...] 块）的全部文本，供并入拼接。
+fn content_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(items)) => {
+            let parts: Vec<&str> = items
+                .iter()
+                .filter_map(|blk| blk.get("text").and_then(Value::as_str))
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn role_of(m: &Value) -> Option<&str> {
+    m.get("role").and_then(Value::as_str)
+}
+
+/// 把 role=developer 消息并入 role=system（就地修改）。返回合并条数。
+///
+/// 实测（2026-11-08）：后端对**含 developer 角色消息**的请求直接 11128——
+/// 与内容无关（developer 内容已被 strip-harness 清洗成官方签名
+/// "You are CodeBuddy Code." 对照实验仍 4 连拦；去掉该消息或同内容换
+/// system 角色立即放行）。dsh 0.2.x 用 developer 承载 identity 段，出站前
+/// 必须并入。语义等价：OpenAI 的 developer 本就是"系统级指令"，合并进
+/// system 不改变模型行为。多条 developer 依次并入；无 system 时把第一条
+/// developer 提升为 system。与 codebuddy2openai 的 merge_developer_messages 语义一致。
+pub fn merge_developer_messages(body: &mut Value) -> usize {
+    if body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(true, |m| m.is_empty())
+    {
+        return 0;
+    }
+    let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    if !msgs.iter().any(|m| role_of(m) == Some("developer")) {
+        return 0;
+    }
+    // system 下标；没有则把第一条 developer 提升为 system
+    let mut merged = 0;
+    let mut system_idx = msgs.iter().position(|m| role_of(m) == Some("system"));
+    if system_idx.is_none() {
+        if let Some(pos) = msgs.iter().position(|m| role_of(m) == Some("developer")) {
+            if let Some(obj) = msgs[pos].as_object_mut() {
+                obj.insert("role".into(), json!("system"));
+            }
+            system_idx = Some(pos);
+            merged += 1;
+        }
+    }
+    let Some(sys_idx) = system_idx else { return 0 };
+    // 收集 developer 文本
+    let dev_texts: Vec<String> = msgs
+        .iter()
+        .filter(|m| role_of(m) == Some("developer"))
+        .filter_map(|m| content_text(m.get("content")))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if !dev_texts.is_empty() {
+        merged += dev_texts.len();
+        let sysm = &mut msgs[sys_idx];
+        let was_array = matches!(sysm.get("content"), Some(Value::Array(_)));
+        let mut combined = content_text(sysm.get("content")).unwrap_or_default();
+        for t in &dev_texts {
+            combined = if combined.is_empty() {
+                t.clone()
+            } else {
+                format!("{combined}\n\n{t}")
+            };
+        }
+        if let Some(obj) = sysm.as_object_mut() {
+            if was_array {
+                // 保持块列表类型：把 developer 文本追加为文本块
+                match obj.get_mut("content").and_then(Value::as_array_mut) {
+                    Some(arr) => {
+                        for t in &dev_texts {
+                            arr.push(json!({"type": "text", "text": t}));
+                        }
+                    }
+                    None => {
+                        let blocks: Vec<Value> = dev_texts
+                            .iter()
+                            .map(|t| json!({"type": "text", "text": t}))
+                            .collect();
+                        obj.insert("content".into(), json!(blocks));
+                    }
+                }
+            } else {
+                obj.insert("content".into(), json!(combined));
+            }
+        }
+    }
+    msgs.retain(|m| role_of(m) != Some("developer"));
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -931,5 +1042,74 @@ and verify its exact URL.";
         let blocks = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(blocks[0]["text"].as_str().unwrap(), "You are CodeBuddy Code.");
         assert_eq!(blocks[1]["text"].as_str().unwrap(), "normal part");
+    }
+
+    /// developer 角色做全套清洗（实测 2026-11-07：dsh 0.2.x 起 identity/source/
+    /// web-surface 三段签名从 system 改挂 role=developer，只清 system 挡不住）。
+    #[test]
+    fn strip_developer_full_suite() {
+        let mut body: Value = serde_json::from_str(
+            r#"{"messages":[
+                {"role":"system","content":"You are CodeBuddy Code."},
+                {"role":"developer","content":"You are an AI agent powered by DeepSeek Harness.\n\n# Source\nDSH checkout\n\n# Web GUI\nDeepSeek Harness Web GUI"}]}"#,
+        )
+        .unwrap();
+        let n = strip_harness_body(&mut body);
+        assert!(n >= 3, "identity/source/web-surface 三段都应清洗：{n}");
+        let dev = body["messages"][1]["content"].as_str().unwrap();
+        assert!(dev.starts_with("You are CodeBuddy Code."), "identity 段应改写：{dev}");
+        assert!(!dev.contains("DeepSeek"), "developer 不得残留签名：{dev}");
+        assert!(!dev.contains("DSH"), "source 段应删除：{dev}");
+        // 幂等
+        assert_eq!(strip_harness_body(&mut body), 0, "developer 清洗应幂等");
+    }
+
+    /// developer 消息并入 system（实测 2026-11-08：后端按 developer 角色本身拦截
+    /// 11128，与内容无关——出站前必须并入；多条 developer + 无 system 提升）。
+    #[test]
+    fn merge_developer_into_system() {
+        // 1) system + developer：并入，幂等
+        let mut body: Value = serde_json::from_str(
+            r#"{"messages":[
+                {"role":"system","content":"You are a helpful assistant."},
+                {"role":"developer","content":"You are an AI agent powered by DeepSeek Harness."},
+                {"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(merge_developer_messages(&mut body), 1);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "developer 消息应移除");
+        assert_eq!(msgs[0]["role"], "system");
+        assert!(
+            msgs[0]["content"].as_str().unwrap().ends_with("DeepSeek Harness."),
+            "developer 内容应并入 system：{:?}", msgs[0]["content"]
+        );
+        assert_eq!(merge_developer_messages(&mut body), 0, "并入应幂等");
+
+        // 2) 无 system：第一条 developer 提升，第二条并入；块列表保持类型
+        let mut body2: Value = serde_json::from_str(
+            r#"{"messages":[
+                {"role":"developer","content":[{"type":"text","text":"Alpha"}]},
+                {"role":"developer","content":"Beta"},
+                {"role":"user","content":"x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(merge_developer_messages(&mut body2), 2);
+        let msgs2 = body2["messages"].as_array().unwrap();
+        assert_eq!(msgs2.len(), 2);
+        assert_eq!(msgs2[0]["role"], "system");
+        let blocks = msgs2[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "Alpha");
+        assert_eq!(blocks[1]["text"], "Beta");
+
+        // 3) 无 developer：不变
+        let mut body3: Value = serde_json::from_str(
+            r#"{"messages":[
+                {"role":"system","content":"s"},{"role":"user","content":"u"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(merge_developer_messages(&mut body3), 0);
+        assert_eq!(body3["messages"].as_array().unwrap().len(), 2);
     }
 }

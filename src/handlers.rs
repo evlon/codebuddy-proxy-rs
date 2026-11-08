@@ -32,6 +32,11 @@ pub struct AppState {
     desensitize_scope_all: bool,
     /// --official-shape（默认开）：补官方 body 形状字段（extra_vars.harnessMetadata 等）。
     official_shape: bool,
+    /// 11128 冷却自愈：拦截时强刷令牌+换身份头，递增冷却重试（delay×序号，默认
+    /// 60s 起、最多 3 次；实测 2026-11-07 冷却窗口以~小时计，立即重试只会加热）。
+    retry_11128: bool,
+    retry_11128_delay: u64,
+    retry_11128_max: u32,
     /// 动态模型目录（/v3/config，TTL 缓存 + 失败兜底）。
     pub catalog: models::ModelCatalog,
 }
@@ -50,6 +55,9 @@ impl AppState {
         models_ttl_secs: u64,
         desensitize_scope_all: bool,
         official_shape: bool,
+        retry_11128: bool,
+        retry_11128_delay: u64,
+        retry_11128_max: u32,
     ) -> Self {
         let catalog = models::ModelCatalog::new(client.clone(), models_ttl_secs);
         AppState {
@@ -62,6 +70,9 @@ impl AppState {
             strip_harness,
             desensitize_scope_all,
             official_shape,
+            retry_11128,
+            retry_11128_delay,
+            retry_11128_max,
             catalog,
         }
     }
@@ -246,6 +257,14 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
     // 内容审核误拦三层防护（顺序与 codebuddy2openai 一致：先清洗签名，再转义，再脱敏——
     // 后面两层都基于清洗后的 system 文本工作）。
     if state.strip_harness {
+        // 先把 role=developer 消息并入 system（实测 2026-11-08：后端按 developer
+        // 角色本身拦截 11128，与内容无关；dsh 0.2.x 用 developer 承载 identity 段）。
+        let dev_merged = desensitize::merge_developer_messages(&mut up_body);
+        if dev_merged > 0 {
+            if let Some(logger) = &state.logger {
+                logger.line(&format!("── strip-harness: developer 消息并入 system {dev_merged} 条"));
+            }
+        }
         let n = desensitize::strip_harness_body(&mut up_body);
         if n > 0 {
             if let Some(logger) = &state.logger {
@@ -266,7 +285,10 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         if state.desensitize_scope_all {
             // dsh 客户端的工具描述/用户笔记里的 dsh/DSH 痕迹是渠道风险分加重因子，
             // scope=all 时全量打散（真实会话 71 处痕迹可打散 68 处）。
-            desensitize::desensitize_body(&mut up_body, &["system", "user", "assistant", "tool"]);
+            desensitize::desensitize_body(
+                &mut up_body,
+                &["system", "developer", "user", "assistant", "tool"],
+            );
             let n = desensitize::desensitize_tools(&mut up_body);
             if n > 0 {
                 if let Some(logger) = &state.logger {
@@ -274,7 +296,9 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
                 }
             }
         } else {
-            desensitize::desensitize_body(&mut up_body, &["system"]);
+            // developer 必须与 system 同待遇（实测 2026-11-07）：dsh 0.2.x 起 identity
+            // 签名段走 role=developer。
+            desensitize::desensitize_body(&mut up_body, &["system", "developer"]);
         }
     }
 
@@ -294,9 +318,12 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
     }
 
     // 转发到后端（官方 CLI 形态的请求头，见 auth::chat_headers）。
-    // 11128 自愈（对齐 codebuddy2openai）：上游非 200 且响应体含 "11128"（渠道拦截）→
-    // 强刷令牌 + 重建身份头，2s 后重试一次。重试轰炸会推高后端渠道热度，故只重试一次；
-    // 其余错误原样透传（流式响应不受影响——错误响应体是小 JSON，缓冲判断无副作用）。
+    // 11128 冷却自愈（实测 2026-11-07：11128 是按账号滚动的渠道热度/冷却机制，
+    // 同一被拦请求体约 1 小时后可原样放行——立即重试只会继续加热，冷却后再试才
+    // 起效）。上游非 200 且响应体含 "11128"（渠道拦截）→ 强刷令牌 + 换身份头，
+    // 按 base_delay × 重试序号递增冷却后重试（默认 60/120/240s，--retry-11128-max
+    // 上限 3 次；--retry-11128 off 退化为一次 2s 快速重试）。本循环为流式与非流式
+    // 共用路径；其余错误原样透传（错误响应体是小 JSON，缓冲判断无副作用）。
     let url = format!("{}/v2/chat/completions", auth::BACKEND);
     let json_bytes = serde_json::to_vec(&up_body).unwrap_or_default();
 
@@ -319,7 +346,9 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
         Ok(h) => h,
         Err(resp) => return resp,
     };
-    let mut retried_11128 = false;
+    let max_retries_11128 = if state.retry_11128 { state.retry_11128_max } else { 1 };
+    let base_delay_11128 = if state.retry_11128 { state.retry_11128_delay.max(1) } else { 2 };
+    let mut attempt_11128: u32 = 0;
     let upstream = loop {
         let resp = match state
             .client
@@ -346,13 +375,18 @@ pub async fn chat(State(state): State<Shared>, request: Request) -> Response {
             ));
             logger.block("ERROR BODY", &raw);
         }
-        if !retried_11128 && raw.contains("11128") {
-            retried_11128 = true;
+        if attempt_11128 < max_retries_11128 && raw.contains("11128") {
+            attempt_11128 += 1;
+            let wait = base_delay_11128 * attempt_11128 as u64;
             if let Some(logger) = &logger {
-                logger.line("── 11128 渠道拦截：强刷令牌+换身份头，2s 后重试一次");
+                logger.line(&format!(
+                    "── 11128 渠道拦截：强刷令牌+换身份头，冷却 {wait}s 后重试（第 {}/{} 次）",
+                    attempt_11128 + 1,
+                    max_retries_11128 + 1
+                ));
             }
             state.auth.force_refresh();
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             headers = match fresh_headers(&state, &model, &client_conversation_id).await {
                 Ok(h) => h,
                 Err(resp) => return resp,

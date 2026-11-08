@@ -31,6 +31,13 @@ pub struct Args {
     pub desensitize_scope_all: bool,
     /// 官方请求形状补齐（默认开）：extra_vars.harnessMetadata 等官方 body 字段。
     pub official_shape: bool,
+    /// 11128 冷却自愈（默认开）：渠道拦截时强刷令牌+换身份头，按
+    /// retry_11128_delay × 重试序号递增冷却重试，最多 retry_11128_max 次。
+    /// 实测 2026-11-07：11128 是按账号滚动的渠道热度/冷却机制，同一被拦请求体
+    /// 约 1 小时后可原样放行；立即重试只会继续加热。
+    pub retry_11128: bool,
+    pub retry_11128_delay: u64,
+    pub retry_11128_max: u32,
 }
 
 impl Default for Args {
@@ -59,6 +66,16 @@ impl Default for Args {
                 .map(|v| v.trim().eq_ignore_ascii_case("all"))
                 .unwrap_or(false),
             official_shape: env_switch("CODEBUDDY2OPENAI_OFFICIAL_SHAPE", true),
+            retry_11128: env_switch("CODEBUDDY2OPENAI_RETRY_11128", true),
+            retry_11128_delay: std::env::var("CODEBUDDY2OPENAI_RETRY_11128_DELAY")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60)
+                .max(1),
+            retry_11128_max: std::env::var("CODEBUDDY2OPENAI_RETRY_11128_MAX")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
         }
     }
 }
@@ -82,8 +99,9 @@ fn env_switch(key: &str, default: bool) -> bool {
 /// 解析 `--host <ip>` / `--port <n>` / `--api-key <key>` / `--log <path>` /
 /// `--desensitize` / `--desensitize-scope system|all` / `--user-escape` /
 /// `--strip-harness on|off` / `--official-shape on|off` / `--log-keep <n>` /
-/// `--private-data true|false` / `--skip-check` / `--models-ttl <secs>` /
-/// `--save-auth <file>` / `--restore-auth <file>`；未知参数忽略。
+/// `--private-data true|false` / `--retry-11128 on|off` /
+/// `--retry-11128-delay <secs>` / `--retry-11128-max <n>` / `--skip-check` /
+/// `--models-ttl <secs>` / `--save-auth <file>` / `--restore-auth <file>`；未知参数忽略。
 pub fn parse() -> Args {
     let mut args = Args::default();
     let mut argv = std::env::args().skip(1);
@@ -156,6 +174,25 @@ pub fn parse() -> Args {
             "--official-shape" => {
                 if let Some(value) = argv.next() {
                     args.official_shape = !value.trim().eq_ignore_ascii_case("off");
+                }
+            }
+            "--retry-11128" => {
+                if let Some(value) = argv.next() {
+                    args.retry_11128 = !value.trim().eq_ignore_ascii_case("off");
+                }
+            }
+            "--retry-11128-delay" => {
+                if let Some(value) = argv.next() {
+                    if let Ok(n) = value.parse::<u64>() {
+                        args.retry_11128_delay = n.max(1);
+                    }
+                }
+            }
+            "--retry-11128-max" => {
+                if let Some(value) = argv.next() {
+                    if let Ok(n) = value.parse::<u32>() {
+                        args.retry_11128_max = n;
+                    }
                 }
             }
             _ => {}
